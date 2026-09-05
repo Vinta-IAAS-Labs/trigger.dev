@@ -1,12 +1,15 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/server-runtime";
 import { json } from "@remix-run/server-runtime";
-import { ScheduleObject, UpdateScheduleOptions } from "@trigger.dev/core/v3";
+import type { ScheduleObject } from "@trigger.dev/core/v3";
+import { UpdateScheduleOptions } from "@trigger.dev/core/v3";
 import { z } from "zod";
 import { Prisma, prisma } from "~/db.server";
-import { scheduleUniqWhereClause } from "~/models/schedules.server";
+import { clientSafeErrorMessage } from "~/utils/prismaErrors";
+import { getScheduleEnvVisibility, scheduleUniqWhereClause } from "~/models/schedules.server";
 import { ViewSchedulePresenter } from "~/presenters/v3/ViewSchedulePresenter.server";
 import { authenticateApiRequest } from "~/services/apiAuth.server";
-import { UpsertSchedule } from "~/v3/schedules";
+import { logger } from "~/services/logger.server";
+import type { UpsertSchedule } from "~/v3/schedules";
 import { ServiceValidationError } from "~/v3/services/baseService.server";
 import { UpsertTaskScheduleService } from "~/v3/services/upsertTaskSchedule.server";
 
@@ -35,6 +38,16 @@ export async function action({ request, params }: ActionFunctionArgs) {
 
   switch (method) {
     case "DELETE": {
+      const visibility = await getScheduleEnvVisibility(
+        prisma,
+        authenticationResult.environment.projectId,
+        parsedParams.data.scheduleId,
+        authenticationResult.environment.id
+      );
+      if (visibility.status !== "visible") {
+        return json({ error: "Schedule not found" }, { status: 404 });
+      }
+
       try {
         const deletedSchedule = await prisma.taskSchedule.delete({
           where: scheduleUniqWhereClause(
@@ -53,14 +66,14 @@ export async function action({ request, params }: ActionFunctionArgs) {
         // Check if it's a Prisma error
         if (error instanceof Prisma.PrismaClientKnownRequestError) {
           return json(
-            { error: error.code === "P2025" ? "Schedule not found" : error.message },
+            {
+              error: error.code === "P2025" ? "Schedule not found" : clientSafeErrorMessage(error),
+            },
             { status: error.code === "P2025" ? 404 : 422 }
           );
         } else {
-          return json(
-            { error: error instanceof Error ? error.message : "Internal Server Error" },
-            { status: 500 }
-          );
+          logger.error("Failed to delete schedule", { error });
+          return json({ error: "Something went wrong, please try again." }, { status: 500 });
         }
       }
     }
@@ -73,6 +86,19 @@ export async function action({ request, params }: ActionFunctionArgs) {
         return json({ error: "Invalid request body", issues: body.error.issues }, { status: 400 });
       }
 
+      // Env-scoped API keys can't see or mutate a schedule whose
+      // instances live in a different environment. "hidden" → refuse;
+      // "missing" → fall through to the upsert's create path.
+      const visibility = await getScheduleEnvVisibility(
+        prisma,
+        authenticationResult.environment.projectId,
+        parsedParams.data.scheduleId,
+        authenticationResult.environment.id
+      );
+      if (visibility.status === "hidden") {
+        return json({ error: "Schedule not found" }, { status: 404 });
+      }
+
       const service = new UpsertTaskScheduleService();
 
       try {
@@ -81,6 +107,7 @@ export async function action({ request, params }: ActionFunctionArgs) {
           taskIdentifier: body.data.task,
           cron: body.data.cron,
           timezone: body.data.timezone,
+          window: body.data.window,
           environments: [authenticationResult.environment.id],
           externalId: body.data.externalId,
         };
@@ -98,10 +125,12 @@ export async function action({ request, params }: ActionFunctionArgs) {
             description: schedule.cronDescription,
           },
           timezone: schedule.timezone,
+          window: schedule.window,
           externalId: schedule.externalId ?? undefined,
           deduplicationKey: schedule.deduplicationKey,
           environments: schedule.environments,
           nextRun: schedule.nextRun,
+          nextRunEffectiveAt: schedule.nextRunEffectiveAt,
         };
 
         return json(responseObject, { status: 200 });
@@ -110,10 +139,8 @@ export async function action({ request, params }: ActionFunctionArgs) {
           return json({ error: error.message }, { status: 422 });
         }
 
-        return json(
-          { error: error instanceof Error ? error.message : "Internal Server Error" },
-          { status: 500 }
-        );
+        logger.error("Failed to upsert schedule", { error });
+        return json({ error: "Something went wrong, please try again." }, { status: 500 });
       }
     }
   }
@@ -136,12 +163,23 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
     );
   }
 
+  const visibility = await getScheduleEnvVisibility(
+    prisma,
+    authenticationResult.environment.projectId,
+    parsedParams.data.scheduleId,
+    authenticationResult.environment.id
+  );
+  if (visibility.status !== "visible") {
+    return json({ error: "Schedule not found" }, { status: 404 });
+  }
+
   const presenter = new ViewSchedulePresenter();
 
   const result = await presenter.call({
     projectId: authenticationResult.environment.projectId,
     friendlyId: parsedParams.data.scheduleId,
     environmentId: authenticationResult.environment.id,
+    includeRunHistory: false,
   });
 
   if (!result) {

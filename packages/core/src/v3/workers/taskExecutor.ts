@@ -1,7 +1,8 @@
-import { Context, context, SpanKind } from "@opentelemetry/api";
+import type { Context } from "@opentelemetry/api";
+import { context, SpanKind } from "@opentelemetry/api";
 import { promiseWithResolvers } from "../../utils.js";
-import { ApiError, RateLimitError } from "../apiClient/errors.js";
-import { ConsoleInterceptor } from "../consoleInterceptor.js";
+import type { ApiError, RateLimitError } from "../apiClient/errors.js";
+import type { ConsoleInterceptor } from "../consoleInterceptor.js";
 import {
   isCompleteTaskWithOutput,
   isInternalError,
@@ -13,35 +14,36 @@ import {
   accessoryAttributes,
   attemptKey,
   flattenAttributes,
+  inputStreams,
   lifecycleHooks,
   OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT,
   runMetadata,
+  sessionStreams,
   traceContext,
   waitUntil,
 } from "../index.js";
-import {
+import type {
   AnyOnMiddlewareHookFunction,
   RegisteredHookFunction,
   TaskCompleteResult,
   TaskInitOutput,
   TaskWait,
 } from "../lifecycleHooks/types.js";
-import { recordSpanException, TracingSDK } from "../otel/index.js";
+import type { TracingSDK } from "../otel/index.js";
+import { recordSpanException } from "../otel/index.js";
 import { runTimelineMetrics } from "../run-timeline-metrics-api.js";
-import {
-  COLD_VARIANT,
+import type {
   RetryOptions,
   TaskRunContext,
-  TaskRunErrorCodes,
   TaskRunExecution,
   TaskRunExecutionResult,
   TaskRunExecutionRetry,
-  WARM_VARIANT,
 } from "../schemas/index.js";
+import { COLD_VARIANT, TaskRunErrorCodes, WARM_VARIANT } from "../schemas/index.js";
 import { SemanticInternalAttributes } from "../semanticInternalAttributes.js";
-import { TriggerTracer } from "../tracer.js";
+import type { TriggerTracer } from "../tracer.js";
 import { tryCatch } from "../tryCatch.js";
-import { HandleErrorModificationOptions, TaskMetadataWithFunctions } from "../types/index.js";
+import type { HandleErrorModificationOptions, TaskMetadataWithFunctions } from "../types/index.js";
 import {
   conditionallyExportPacket,
   conditionallyImportPacket,
@@ -449,7 +451,7 @@ export class TaskExecutor {
       return;
     }
 
-    const result = await runTimelineMetrics.measureMetric(
+    const _result = await runTimelineMetrics.measureMetric(
       "trigger.dev/execution",
       "onWait",
       async () => {
@@ -522,7 +524,7 @@ export class TaskExecutor {
       return;
     }
 
-    const result = await runTimelineMetrics.measureMetric(
+    const _result = await runTimelineMetrics.measureMetric(
       "trigger.dev/execution",
       "onCancel",
       async () => {
@@ -603,7 +605,7 @@ export class TaskExecutor {
       return;
     }
 
-    const result = await runTimelineMetrics.measureMetric(
+    const _result = await runTimelineMetrics.measureMetric(
       "trigger.dev/execution",
       "onResume",
       async () => {
@@ -1046,6 +1048,8 @@ export class TaskExecutor {
     signal: AbortSignal
   ) {
     await this.#callCleanupFunctions(payload, ctx, initOutput, signal);
+    inputStreams.clearHandlers();
+    sessionStreams.clearHandlers();
     await this.#blockForWaitUntil();
   }
 
@@ -1414,8 +1418,8 @@ export class TaskExecutor {
           error instanceof Error
             ? `${error.name}: ${error.message}`
             : typeof error === "string"
-            ? error
-            : undefined,
+              ? error
+              : undefined,
         stackTrace: error instanceof Error ? error.stack : undefined,
       },
       skippedRetrying,

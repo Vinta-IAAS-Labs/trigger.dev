@@ -1,5 +1,8 @@
 import type { TaskTriggerSource } from "@trigger.dev/database";
-import { PrismaClientOrTransaction, sqlDatabaseSchema } from "~/db.server";
+import type { PrismaClientOrTransaction } from "~/db.server";
+import { sqlDatabaseSchema } from "~/db.server";
+
+export { getTaskIdentifiers } from "~/services/taskIdentifierRegistry.server";
 
 /**
  *

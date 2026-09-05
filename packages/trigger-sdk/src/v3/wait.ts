@@ -1,7 +1,5 @@
 import { SpanStatusCode } from "@opentelemetry/api";
-import {
-  accessoryAttributes,
-  apiClientManager,
+import type {
   ApiPromise,
   ApiRequestOptions,
   CompleteWaitpointTokenResponseBody,
@@ -9,16 +7,22 @@ import {
   CreateWaitpointTokenResponse,
   CreateWaitpointTokenResponseBody,
   CursorPagePromise,
-  flattenAttributes,
   ListWaitpointTokensQueryParams,
-  mergeRequestOptions,
-  runtime,
-  SemanticInternalAttributes,
-  taskContext,
   WaitpointListTokenItem,
   WaitpointRetrieveTokenResponse,
   WaitpointTokenStatus,
   WaitpointTokenTypedResult,
+} from "@trigger.dev/core/v3";
+import {
+  accessoryAttributes,
+  apiClientManager,
+  flattenAttributes,
+  ManualWaitpointPromise,
+  mergeRequestOptions,
+  runtime,
+  SemanticInternalAttributes,
+  taskContext,
+  WaitpointTimeoutError,
 } from "@trigger.dev/core/v3";
 import { conditionallyImportAndParsePacket } from "@trigger.dev/core/v3/utils/ioSerialization";
 import { tracer } from "./tracer.js";
@@ -378,12 +382,7 @@ type WaitPeriod =
       years: number;
     };
 
-export class WaitpointTimeoutError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "WaitpointTimeoutError";
-  }
-}
+export { WaitpointTimeoutError, ManualWaitpointPromise } from "@trigger.dev/core/v3";
 
 const DURATION_WAIT_CHARGE_THRESHOLD_MS = 5000;
 
@@ -391,29 +390,6 @@ function printWaitBelowThreshold() {
   console.warn(
     `Waits of ${DURATION_WAIT_CHARGE_THRESHOLD_MS / 1000}s or less count towards compute usage.`
   );
-}
-
-class ManualWaitpointPromise<TOutput> extends Promise<WaitpointTokenTypedResult<TOutput>> {
-  constructor(
-    executor: (
-      resolve: (
-        value: WaitpointTokenTypedResult<TOutput> | PromiseLike<WaitpointTokenTypedResult<TOutput>>
-      ) => void,
-      reject: (reason?: any) => void
-    ) => void
-  ) {
-    super(executor);
-  }
-
-  unwrap(): Promise<TOutput> {
-    return this.then((result) => {
-      if (result.ok) {
-        return result.output;
-      } else {
-        throw new WaitpointTimeoutError(result.error.message);
-      }
-    });
-  }
 }
 
 export const wait = {

@@ -15,10 +15,6 @@ export const ProjectAlertEmailProperties = z.object({
 
 export type ProjectAlertEmailProperties = z.infer<typeof ProjectAlertEmailProperties>;
 
-export const DeleteProjectAlertChannel = z.object({
-  id: z.string(),
-});
-
 export const ProjectAlertSlackProperties = z.object({
   channelId: z.string(),
   channelName: z.string(),
@@ -32,3 +28,9 @@ export const ProjectAlertSlackStorage = z.object({
 });
 
 export type ProjectAlertSlackStorage = z.infer<typeof ProjectAlertSlackStorage>;
+
+export const ErrorAlertConfig = z.object({
+  evaluationIntervalMs: z.number().min(60_000).default(300_000),
+});
+
+export type ErrorAlertConfig = z.infer<typeof ErrorAlertConfig>;

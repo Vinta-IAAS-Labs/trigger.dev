@@ -1,8 +1,8 @@
-import { ResolvedConfig } from "@trigger.dev/core/v3/build";
-import * as esbuild from "esbuild";
-import { CliApiClient } from "../apiClient.js";
+import type { ResolvedConfig } from "@trigger.dev/core/v3/build";
+import type * as esbuild from "esbuild";
+import type { CliApiClient } from "../apiClient.js";
+import type { BundleResult } from "../build/bundle.js";
 import {
-  BundleResult,
   bundleWorker,
   createBuildManifestFromBundle,
   getBundleResultFromBuild,
@@ -16,23 +16,24 @@ import {
   resolvePluginsForContext,
 } from "../build/extensions.js";
 import { createExternalsBuildExtension, resolveAlwaysExternal } from "../build/externals.js";
+import {
+  collectCreateRequireWarningMessages,
+  CreateRequireCollector,
+  extensionInstalledPackageMatchers,
+} from "../build/createRequireWarnings.js";
 import { type DevCommandOptions } from "../commands/dev.js";
 import { eventBus } from "../utilities/eventBus.js";
 import { logger } from "../utilities/logger.js";
-import {
-  clearTmpDirs,
-  EphemeralDirectory,
-  getStoreDir,
-  getTmpDir,
-} from "../utilities/tempDirectories.js";
+import type { EphemeralDirectory } from "../utilities/tempDirectories.js";
+import { clearTmpDirs, getStoreDir, getTmpDir } from "../utilities/tempDirectories.js";
 import { startDevOutput } from "./devOutput.js";
 import { startWorkerRuntime } from "./devSupervisor.js";
-import { startMcpServer, stopMcpServer } from "./mcpServer.js";
 import { writeJSONFile } from "../utilities/fileSystem.js";
 import { join } from "node:path";
 
 export type DevSessionOptions = {
   name: string | undefined;
+  branch?: string;
   dashboardUrl: string;
   initialMode: "local";
   showInteractiveDevSession: boolean | undefined;
@@ -50,37 +51,29 @@ export type DevSessionInstance = {
 export async function startDevSession({
   rawConfig,
   name,
+  branch,
   rawArgs,
   client,
   dashboardUrl,
   keepTmpFiles,
 }: DevSessionOptions): Promise<DevSessionInstance> {
-  clearTmpDirs(rawConfig.workingDir);
-  const destination = getTmpDir(rawConfig.workingDir, "build", keepTmpFiles);
+  clearTmpDirs(rawConfig.workingDir, branch);
+  const destination = getTmpDir(rawConfig.workingDir, "build", keepTmpFiles, branch);
   // Create shared store directory for deduplicating chunk files across rebuilds
-  const storeDir = getStoreDir(rawConfig.workingDir, keepTmpFiles);
+  const storeDir = getStoreDir(rawConfig.workingDir, keepTmpFiles, branch);
 
   const runtime = await startWorkerRuntime({
     name,
+    branch,
     config: rawConfig,
     args: rawArgs,
     client,
     dashboardUrl,
   });
 
-  if (rawArgs.mcp) {
-    await startMcpServer({
-      port: rawArgs.mcpPort,
-      cliApiClient: client,
-      devSession: {
-        dashboardUrl,
-        projectRef: rawConfig.project,
-      },
-    });
-  }
-
   const stopOutput = startDevOutput({
     name,
+    branch,
     dashboardUrl,
     config: rawConfig,
     args: rawArgs,
@@ -95,6 +88,8 @@ export async function startDevSession({
   });
 
   const externalsExtension = createExternalsBuildExtension("dev", rawConfig, alwaysExternal);
+  const createRequireCollector = new CreateRequireCollector(rawConfig.workingDir);
+  const extensionPackages = extensionInstalledPackageMatchers(rawConfig);
   const buildContext = createBuildContext("dev", rawConfig);
   buildContext.prependExtension(externalsExtension);
   await notifyExtensionOnBuildStart(buildContext);
@@ -118,7 +113,25 @@ export async function startDevSession({
       bundle.metafile
     );
 
+    // Skill folder copying happens after the main worker indexer runs in
+    // `BackgroundWorker.initialize` — that pass already discovers skills
+    // via the resource catalog and reports them on `workerManifest.skills`,
+    // so we don't need a duplicate indexer here (which historically ran
+    // with a bare `process.env` and silently dropped skills on projects
+    // whose task files read CLI-injected vars at module top level).
+
     buildManifest = await notifyExtensionOnBuildComplete(buildContext, buildManifest);
+
+    const createRequireWarnings = collectCreateRequireWarningMessages({
+      usages: createRequireCollector.usages,
+      buildManifest,
+      extensionPackages,
+      target: "dev",
+    });
+
+    if (createRequireWarnings.length > 0) {
+      logBuildWarnings(createRequireWarnings);
+    }
 
     try {
       logger.debug("Updated bundle", { bundle, buildManifest });
@@ -180,7 +193,7 @@ export async function startDevSession({
           return;
         }
 
-        const workerDir = getTmpDir(rawConfig.workingDir, "build", keepTmpFiles);
+        const workerDir = getTmpDir(rawConfig.workingDir, "build", keepTmpFiles, branch);
         await updateBuild(result, workerDir);
       });
     },
@@ -199,7 +212,7 @@ export async function startDevSession({
         destination: destination.path,
         watch: true,
         resolvedConfig: rawConfig,
-        plugins: [...pluginsFromExtensions, onEnd],
+        plugins: [createRequireCollector.plugin, ...pluginsFromExtensions, onEnd],
         jsxFactory: rawConfig.build.jsx.factory,
         jsxFragment: rawConfig.build.jsx.fragment,
         jsxAutomatic: rawConfig.build.jsx.automatic,
@@ -230,7 +243,6 @@ export async function startDevSession({
       stopBundling?.().catch((error) => {});
       runtime.shutdown().catch((error) => {});
       stopOutput();
-      stopMcpServer();
     },
   };
 }

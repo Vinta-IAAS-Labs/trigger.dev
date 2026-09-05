@@ -18,6 +18,7 @@ import {
   isAbortError,
   WorkerQueueManager,
   type FairQueueOptions,
+  type GlobalRateLimiter,
 } from "@trigger.dev/redis-worker";
 import { BatchCompletionTracker } from "./completionTracker.js";
 import type {
@@ -76,6 +77,7 @@ export class BatchQueue {
   private abortController: AbortController;
   private workerQueueConsumerLoops: Promise<void>[] = [];
   private workerQueueBlockingTimeoutSeconds: number;
+  private globalRateLimiter?: GlobalRateLimiter;
   private batchedSpanManager: BatchedSpanManager;
 
   // Metrics
@@ -87,6 +89,7 @@ export class BatchQueue {
   private batchProcessingDurationHistogram?: Histogram;
   private itemQueueTimeHistogram?: Histogram;
   private workerQueueLengthGauge?: ObservableGauge;
+  private rateLimitDeniedCounter?: Counter;
 
   constructor(private options: BatchQueueOptions) {
     this.logger = options.logger ?? new Logger("BatchQueue", options.logLevel ?? "info");
@@ -95,6 +98,7 @@ export class BatchQueue {
     this.maxAttempts = options.retry?.maxAttempts ?? 1;
     this.abortController = new AbortController();
     this.workerQueueBlockingTimeoutSeconds = options.workerQueueBlockingTimeoutSeconds ?? 10;
+    this.globalRateLimiter = options.globalRateLimiter;
 
     // Initialize metrics if meter is provided
     if (options.meter) {
@@ -153,9 +157,7 @@ export class BatchQueue {
       visibilityTimeoutMs: 60_000, // 1 minute for batch item processing
       startConsumers: false, // We control when to start
       cooloff: {
-        enabled: true,
-        threshold: 5,
-        periodMs: 5_000,
+        enabled: false,
       },
       // Worker queue configuration - FairQueue routes all messages to our single worker queue
       workerQueue: {
@@ -176,24 +178,25 @@ export class BatchQueue {
           },
         },
       ],
-      // Optional global rate limiter to limit max items/sec across all consumers
-      globalRateLimiter: options.globalRateLimiter,
+      // Worker queue depth cap to prevent unbounded growth (protects visibility timeouts)
+      workerQueueMaxDepth: options.workerQueueMaxDepth,
+      workerQueueDepthCheckId: BATCH_WORKER_QUEUE_ID,
       // Enable retry with DLQ disabled when retry config is provided.
       // BatchQueue handles the "final failure" in its own processing loop,
       // so we don't need the DLQ - we just need the retry scheduling.
       ...(options.retry
         ? {
-          retry: {
-            strategy: new ExponentialBackoffRetry({
-              maxAttempts: options.retry.maxAttempts,
-              minTimeoutInMs: options.retry.minTimeoutInMs ?? 1_000,
-              maxTimeoutInMs: options.retry.maxTimeoutInMs ?? 30_000,
-              factor: options.retry.factor ?? 2,
-              randomize: options.retry.randomize ?? true,
-            }),
-            deadLetterQueue: false,
-          },
-        }
+            retry: {
+              strategy: new ExponentialBackoffRetry({
+                maxAttempts: options.retry.maxAttempts,
+                minTimeoutInMs: options.retry.minTimeoutInMs ?? 1_000,
+                maxTimeoutInMs: options.retry.maxTimeoutInMs ?? 30_000,
+                factor: options.retry.factor ?? 2,
+                randomize: options.retry.randomize ?? true,
+              }),
+              deadLetterQueue: false,
+            },
+          }
         : {}),
       logger: this.logger,
       tracer: options.tracer,
@@ -293,6 +296,7 @@ export class BatchQueue {
       realtimeStreamsVersion: options.realtimeStreamsVersion,
       idempotencyKey: options.idempotencyKey,
       processingConcurrency: options.processingConcurrency,
+      triggerSource: options.triggerSource,
     };
 
     // Store metadata in completion tracker
@@ -610,6 +614,11 @@ export class BatchQueue {
       unit: "ms",
     });
 
+    this.rateLimitDeniedCounter = meter.createCounter("batch_queue.rate_limit_denied", {
+      description: "Number of times the global rate limiter denied processing",
+      unit: "denials",
+    });
+
     this.workerQueueLengthGauge = meter.createObservableGauge("batch_queue.worker_queue.length", {
       description: "Number of items waiting in the batch worker queue",
       unit: "items",
@@ -643,6 +652,42 @@ export class BatchQueue {
         }
 
         try {
+          // Rate limit per-item at the processing level (1 token per message).
+          // Loop until allowed so multiple consumers don't all rush through after one sleep.
+          if (this.globalRateLimiter) {
+            while (this.isRunning) {
+              const result = await this.globalRateLimiter.limit();
+              if (result.allowed) {
+                break;
+              }
+              this.rateLimitDeniedCounter?.add(1);
+              const waitMs = Math.max(10, (result.resetAt ?? Date.now()) - Date.now());
+              if (waitMs > 0) {
+                await new Promise<void>((resolve, reject) => {
+                  const onAbort = () => {
+                    clearTimeout(timer);
+                    reject(this.abortController.signal.reason);
+                  };
+                  const timer = setTimeout(() => {
+                    // Must remove listener when timeout fires, otherwise listeners accumulate
+                    // (the { once: true } option only removes on abort, not on timeout)
+                    this.abortController.signal.removeEventListener("abort", onAbort);
+                    resolve();
+                  }, waitMs);
+                  if (this.abortController.signal.aborted) {
+                    clearTimeout(timer);
+                    reject(this.abortController.signal.reason);
+                    return;
+                  }
+                  this.abortController.signal.addEventListener("abort", onAbort, { once: true });
+                });
+              }
+            }
+            if (!this.isRunning) {
+              break;
+            }
+          }
+
           await this.batchedSpanManager.withBatchedSpan(
             loopId,
             async (span) => {
@@ -820,8 +865,16 @@ export class BatchQueue {
             span?.setAttribute("batch.errorCode", result.errorCode);
           }
 
-          // If retries are available, use FairQueue retry scheduling
-          if (!isFinalAttempt) {
+          const skipRetries = result.skipRetries === true;
+          if (skipRetries) {
+            span?.setAttribute("batch.skipRetries", true);
+          }
+
+          // If retries are available AND the callback didn't opt out, use
+          // FairQueue retry scheduling. `skipRetries` short-circuits this
+          // regardless of attempt number so the batch can finalize quickly
+          // when the error is known to be non-recoverable on retry.
+          if (!isFinalAttempt && !skipRetries) {
             span?.setAttribute("batch.retry", true);
             span?.setAttribute("batch.attempt", attempt);
 
@@ -834,23 +887,23 @@ export class BatchQueue {
             });
 
             await this.#startSpan("BatchQueue.failMessage", async () => {
-              return this.fairQueue.failMessage(
-                messageId,
-                queueId,
-                new Error(result.error)
-              );
+              return this.fairQueue.failMessage(messageId, queueId, new Error(result.error));
             });
 
             // Don't record failure or check completion - message will be retried
             return;
           }
 
-          // Final attempt exhausted - record permanent failure
+          // Final attempt exhausted (or retries skipped) - record permanent failure
           const payloadStr = await this.#startSpan(
             "BatchQueue.serializePayload",
             async (innerSpan) => {
               const str =
-                typeof item.payload === "string" ? item.payload : JSON.stringify(item.payload);
+                item.payload === undefined || item.payload === null
+                  ? "{}"
+                  : typeof item.payload === "string"
+                    ? item.payload
+                    : JSON.stringify(item.payload);
               innerSpan?.setAttribute("batch.payloadSize", str.length);
               return str;
             }
@@ -872,14 +925,30 @@ export class BatchQueue {
             errorCode: result.errorCode,
           });
 
-          this.logger.error("Batch item processing failed after all attempts", {
-            batchId,
-            itemIndex,
-            error: result.error,
-            processedCount,
-            expectedCount: meta.runCount,
-            attempts: attempt,
-          });
+          // skipRetries=true means the callback knew the failure was
+          // intentional/non-retryable (e.g. customer hit queue size limit).
+          // Don't promote it back to error — the callback already logged
+          // appropriately and a permanent-failure record was written.
+          if (result.skipRetries) {
+            this.logger.warn("Batch item processing failed (non-retryable)", {
+              batchId,
+              itemIndex,
+              error: result.error,
+              errorCode: result.errorCode,
+              processedCount,
+              expectedCount: meta.runCount,
+              attempts: attempt,
+            });
+          } else {
+            this.logger.error("Batch item processing failed after all attempts", {
+              batchId,
+              itemIndex,
+              error: result.error,
+              processedCount,
+              expectedCount: meta.runCount,
+              attempts: attempt,
+            });
+          }
         }
       } catch (error) {
         span?.setAttribute("batch.result", "unexpected_error");
@@ -914,7 +983,11 @@ export class BatchQueue {
           "BatchQueue.serializePayload",
           async (innerSpan) => {
             const str =
-              typeof item.payload === "string" ? item.payload : JSON.stringify(item.payload);
+              item.payload === undefined || item.payload === null
+                ? "{}"
+                : typeof item.payload === "string"
+                  ? item.payload
+                  : JSON.stringify(item.payload);
             innerSpan?.setAttribute("batch.payloadSize", str.length);
             return str;
           }

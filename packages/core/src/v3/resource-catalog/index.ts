@@ -1,7 +1,20 @@
 const API_NAME = "resource-catalog";
 
-import { QueueManifest, TaskManifest, WorkerManifest } from "../schemas/index.js";
-import { TaskMetadataWithFunctions, TaskSchema } from "../types/index.js";
+import type {
+  PromptManifest,
+  QueueManifest,
+  SkillManifest,
+  SkillMetadata,
+  TaskManifest,
+  WebhookManifest,
+  WebhookMetadata,
+  WorkerManifest,
+} from "../schemas/index.js";
+import type {
+  PromptMetadataWithFunctions,
+  TaskMetadataWithFunctions,
+  TaskSchema,
+} from "../types/index.js";
 import { getGlobal, registerGlobal, unregisterGlobal } from "../utils/globals.js";
 import { type ResourceCatalog } from "./catalog.js";
 import { NoopResourceCatalog } from "./noopResourceCatalog.js";
@@ -57,6 +70,10 @@ export class ResourceCatalogAPI {
     return this.#getCatalog().listTaskManifests();
   }
 
+  public listTaskIdCollisions(): Array<{ id: string; filePaths: string[] }> {
+    return this.#getCatalog().listTaskIdCollisions();
+  }
+
   public getTaskManifest(id: string): TaskManifest | undefined {
     return this.#getCatalog().getTaskManifest(id);
   }
@@ -75,6 +92,56 @@ export class ResourceCatalogAPI {
 
   public listQueueManifests(): Array<QueueManifest> {
     return this.#getCatalog().listQueueManifests();
+  }
+
+  public registerPromptMetadata(prompt: PromptMetadataWithFunctions): void {
+    this.#getCatalog().registerPromptMetadata(prompt);
+  }
+
+  public listPromptManifests(): Array<PromptManifest> {
+    return this.#getCatalog().listPromptManifests();
+  }
+
+  public getPrompt(id: string): PromptMetadataWithFunctions | undefined {
+    return this.#getCatalog().getPrompt(id);
+  }
+
+  public getPromptSchema(id: string): TaskSchema | undefined {
+    return this.#getCatalog().getPromptSchema(id);
+  }
+
+  public registerSkillMetadata(skill: SkillMetadata): void {
+    this.#getCatalog().registerSkillMetadata(skill);
+  }
+
+  public listSkillManifests(): Array<SkillManifest> {
+    return this.#getCatalog().listSkillManifests();
+  }
+
+  public getSkillManifest(id: string): SkillManifest | undefined {
+    return this.#getCatalog().getSkillManifest(id);
+  }
+
+  public registerWebhookMetadata(webhook: WebhookMetadata): void {
+    this.#getCatalog().registerWebhookMetadata(webhook);
+  }
+  public listWebhookManifests(): Array<WebhookManifest> {
+    return this.#getCatalog().listWebhookManifests();
+  }
+  public getWebhookManifest(id: string): WebhookManifest | undefined {
+    return this.#getCatalog().getWebhookManifest(id);
+  }
+  public listWebhookIdCollisions(): Array<{ id: string; filePaths: string[] }> {
+    return this.#getCatalog().listWebhookIdCollisions();
+  }
+  public registerDeclaredSessionWebhook(id: string): void {
+    this.#getCatalog().registerDeclaredSessionWebhook(id);
+  }
+  public markSessionWebhookClaimed(id: string): void {
+    this.#getCatalog().markSessionWebhookClaimed(id);
+  }
+  public listUnclaimedSessionWebhooks(): Array<string> {
+    return this.#getCatalog().listUnclaimedSessionWebhooks();
   }
 
   #getCatalog(): ResourceCatalog {

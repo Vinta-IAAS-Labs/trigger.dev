@@ -1,5 +1,9 @@
-import type { RunQueueKeyProducerEnvironment } from "./types.js";
-import { EnvDescriptor, QueueDescriptor, RunQueueKeyProducer } from "./types.js";
+import {
+  type RunQueueKeyProducerEnvironment,
+  type EnvDescriptor,
+  type QueueDescriptor,
+  type RunQueueKeyProducer,
+} from "./types.js";
 import { jumpHash } from "@trigger.dev/core/v3/serverOnly";
 
 const constants = {
@@ -17,6 +21,9 @@ const constants = {
   DEAD_LETTER_QUEUE_PART: "deadLetter",
   MASTER_QUEUE_PART: "masterQueue",
   WORKER_QUEUE_PART: "workerQueue",
+  CK_INDEX_PART: "ckIndex",
+  LENGTH_COUNTER_PART: "lengthCounter",
+  RUNNING_COUNTER_PART: "runningCounter",
 } as const;
 
 export class RunQueueFullKeyProducer implements RunQueueKeyProducer {
@@ -134,8 +141,7 @@ export class RunQueueFullKeyProducer implements RunQueueKeyProducer {
   }
 
   queueConcurrencyLimitKeyFromQueue(queue: string) {
-    const concurrencyQueueName = queue.replace(/:ck:.+$/, "");
-    return `${concurrencyQueueName}:${constants.CONCURRENCY_LIMIT_PART}`;
+    return `${this.baseQueueKeyFromQueue(queue)}:${constants.CONCURRENCY_LIMIT_PART}`;
   }
 
   queueCurrentConcurrencyKeyFromQueue(queue: string) {
@@ -305,6 +311,42 @@ export class RunQueueFullKeyProducer implements RunQueueKeyProducer {
     return ["ttl", "shard", shard.toString()].join(":");
   }
 
+  ckIndexKeyFromQueue(queue: string): string {
+    return `${this.baseQueueKeyFromQueue(queue)}:${constants.CK_INDEX_PART}`;
+  }
+
+  // indexOf instead of /:ck:.+$/ (queue names are user-controlled; polynomial regex).
+  // Only strips when at least one character follows ":ck:", matching the old semantics.
+  baseQueueKeyFromQueue(queue: string): string {
+    const idx = queue.indexOf(":ck:");
+    return idx === -1 || idx + 4 >= queue.length ? queue : queue.slice(0, idx);
+  }
+
+  queueLengthCounterKey(env: RunQueueKeyProducerEnvironment, queue: string): string {
+    return `${this.queueKey(env, queue)}:${constants.LENGTH_COUNTER_PART}`;
+  }
+
+  queueLengthCounterKeyFromQueue(queue: string): string {
+    return `${this.baseQueueKeyFromQueue(queue)}:${constants.LENGTH_COUNTER_PART}`;
+  }
+
+  queueRunningCounterKey(env: RunQueueKeyProducerEnvironment, queue: string): string {
+    return `${this.queueKey(env, queue)}:${constants.RUNNING_COUNTER_PART}`;
+  }
+
+  queueRunningCounterKeyFromQueue(queue: string): string {
+    return `${this.baseQueueKeyFromQueue(queue)}:${constants.RUNNING_COUNTER_PART}`;
+  }
+
+  isCkWildcard(queue: string): boolean {
+    return queue.endsWith(":ck:*");
+  }
+
+  toCkWildcard(queue: string): string {
+    const base = this.baseQueueKeyFromQueue(queue);
+    return base === queue ? queue : `${base}:ck:*`;
+  }
+
   descriptorFromQueue(queue: string): QueueDescriptor {
     const parts = queue.split(":");
     return {
@@ -312,7 +354,7 @@ export class RunQueueFullKeyProducer implements RunQueueKeyProducer {
       projectId: parts[3],
       envId: parts[5],
       queue: parts[7],
-      concurrencyKey: parts.at(9),
+      concurrencyKey: parts[9],
     };
   }
 

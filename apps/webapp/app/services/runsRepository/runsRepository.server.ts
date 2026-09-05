@@ -1,4 +1,5 @@
 import { type ClickHouse } from "@internal/clickhouse";
+import { type RunStore } from "@internal/run-store";
 import { type Tracer } from "@internal/tracing";
 import { type Logger, type LogLevel } from "@trigger.dev/core/logger";
 import { MachinePresetName } from "@trigger.dev/core/v3";
@@ -7,12 +8,37 @@ import { type Prisma, TaskRunStatus } from "@trigger.dev/database";
 import parseDuration from "parse-duration";
 import { z } from "zod";
 import { timeFilters } from "~/components/runs/v3/SharedFilters";
-import { type PrismaClient, type PrismaClientOrTransaction } from "~/db.server";
-import { FEATURE_FLAG, makeFlag } from "~/v3/featureFlags.server";
+import { type PrismaClientOrTransaction } from "~/db.server";
+import { runStore as defaultRunStore } from "~/v3/runStore.server";
 import { startActiveSpan } from "~/v3/tracer.server";
-import { logger } from "../logger.server";
 import { ClickHouseRunsRepository } from "./clickhouseRunsRepository.server";
-import { PostgresRunsRepository } from "./postgresRunsRepository.server";
+
+/**
+ * User-facing message when a runs-list query exceeds a ClickHouse resource limit. It tells the
+ * caller how to recover (a narrower time range restores partition pruning), and is safe to show
+ * on the dashboard and return from the public API.
+ */
+const RUNS_LIST_QUERY_TOO_EXPENSIVE_MESSAGE =
+  "This query was too expensive to run over the selected time range. Narrow the time window (a shorter period, or a smaller createdAt from/to range) and try again.";
+
+/**
+ * Thrown when a runs-list ClickHouse query hits a server-side resource limit (execution time or
+ * memory). It is the caller's query being too broad, not a service fault, so it carries a 4xx
+ * status and a recovery message rather than surfacing as a 500.
+ */
+export class RunsListQueryError extends Error {
+  public readonly name = "RunsListQueryError";
+  public readonly status = 422;
+  constructor(
+    message: string = RUNS_LIST_QUERY_TOO_EXPENSIVE_MESSAGE,
+    options?: { cause?: unknown }
+  ) {
+    super(message);
+    if (options?.cause !== undefined) {
+      this.cause = options.cause;
+    }
+  }
+}
 
 export type RunsRepositoryOptions = {
   clickhouse: ClickHouse;
@@ -20,6 +46,20 @@ export type RunsRepositoryOptions = {
   logger?: Logger;
   logLevel?: LogLevel;
   tracer?: Tracer;
+
+  // Injectable run-ops store; defaults to the `~/v3/runStore.server` singleton
+  // (passthrough). The list-hydrate fan-out below does not depend on the store
+  // routing mixed-residency id sets — it applies the read-through fan-out itself.
+  runStore?: RunStore;
+
+  // Run-ops read-through wiring for the list hydrate. Omitted => passthrough.
+  readThrough?: {
+    // `legacyReplica` is a READ REPLICA handle only — there is no legacy-primary field.
+    newClient?: PrismaClientOrTransaction;
+    legacyReplica?: PrismaClientOrTransaction;
+    // Resolved boot constant; when false the split branch is never entered.
+    splitEnabled?: boolean;
+  };
 };
 
 const RunStatus = z.enum(Object.values(TaskRunStatus) as [TaskRunStatus, ...TaskRunStatus[]]);
@@ -33,6 +73,8 @@ const RunListInputOptionsSchema = z.object({
   versions: z.array(z.string()).optional(),
   statuses: z.array(RunStatus).optional(),
   tags: z.array(z.string()).optional(),
+  // "any" (default) = run has at least one of `tags`; "all" = run has every tag.
+  tagsMatch: z.enum(["any", "all"]).optional(),
   scheduleId: z.string().optional(),
   period: z.string().optional(),
   from: z.number().optional(),
@@ -43,7 +85,10 @@ const RunListInputOptionsSchema = z.object({
   runId: z.array(z.string()).optional(),
   bulkId: z.string().optional(),
   queues: z.array(z.string()).optional(),
+  regions: z.array(z.string()).optional(),
   machines: MachinePresetName.array().optional(),
+  errorId: z.string().optional(),
+  taskKinds: z.array(z.string()).optional(),
 });
 
 export type RunListInputOptions = z.infer<typeof RunListInputOptionsSchema>;
@@ -55,6 +100,7 @@ export type RunListInputFilters = Omit<
 export type ParsedRunFilters = RunListInputFilters & {
   cursor?: string;
   direction?: "forward" | "backward";
+  sources?: string[];
 };
 
 export type FilterRunsOptions = Omit<RunListInputOptions, "period"> & {
@@ -100,14 +146,37 @@ export type ListedRun = Prisma.TaskRunGetPayload<{
     depth: true;
     rootTaskRunId: true;
     batchId: true;
-    metadata: true;
-    metadataType: true;
     machinePreset: true;
     queue: true;
+    workerQueue: true;
+    region: true;
+    annotations: true;
   };
-}>;
+}> & {
+  /**
+   * Source blobs hydrated only when a smart column references them (see
+   * `runSelect`). Absent from the default list select; metadata is display-only
+   * on the list, payload/output can be large.
+   */
+  payload?: string;
+  payloadType?: string;
+  output?: string | null;
+  outputType?: string;
+  metadata?: string | null;
+  metadataType?: string;
+};
 
-export type ListRunsOptions = RunListInputOptions & Pagination;
+export type ListRunsOptions = RunListInputOptions &
+  Pagination & {
+    /**
+     * Overrides the default list `select`. The runs list derives this from the
+     * visible columns so only the fields a shown column needs are hydrated (in
+     * particular payload/output are omitted unless a smart column asks). Must
+     * include `id` for hydration keying; behaviour-critical fields are enforced
+     * by the caller's `deriveRunSelect`.
+     */
+    runSelect?: Prisma.TaskRunSelect;
+  };
 
 export type TagListOptions = {
   organizationId: string;
@@ -124,9 +193,25 @@ export type TagList = {
   tags: string[];
 };
 
+type CursorPagination = {
+  nextCursor: string | null;
+  previousCursor: string | null;
+};
+
+export type RunIdsPage = {
+  runIds: string[];
+  pagination: CursorPagination;
+};
+
 export interface IRunsRepository {
   name: string;
-  listRunIds(options: ListRunsOptions): Promise<string[]>;
+  /**
+   * A keyset-paginated page of run ids plus the cursors to navigate
+   * forward/backward. The cursors are opaque composite `(created_at, run_id)`
+   * tokens, so pagination can't duplicate or skip runs. This is the single
+   * cursor-aware list primitive — `listRuns` and bulk actions build on it.
+   */
+  listRunIds(options: ListRunsOptions): Promise<RunIdsPage>;
   /** Returns friendly IDs (e.g., run_xxx) instead of internal UUIDs. Used for ClickHouse task_events queries. */
   listFriendlyRunIds(options: ListRunsOptions): Promise<string[]>;
   listRuns(options: ListRunsOptions): Promise<{
@@ -138,85 +223,52 @@ export interface IRunsRepository {
   }>;
   countRuns(options: RunListInputOptions): Promise<number>;
   listTags(options: TagListOptions): Promise<TagList>;
+  runExistsInEnvironment(options: {
+    organizationId: string;
+    projectId: string;
+    environmentId: string;
+    createdAtLowerBoundMs?: number;
+  }): Promise<boolean>;
 }
 
 export class RunsRepository implements IRunsRepository {
   private readonly clickHouseRunsRepository: ClickHouseRunsRepository;
-  private readonly postgresRunsRepository: PostgresRunsRepository;
-  private readonly defaultRepository: "clickhouse" | "postgres";
-  private readonly logger: Logger;
 
-  constructor(
-    private readonly options: RunsRepositoryOptions & {
-      defaultRepository?: "clickhouse" | "postgres";
-    }
-  ) {
+  constructor(private readonly options: RunsRepositoryOptions) {
     this.clickHouseRunsRepository = new ClickHouseRunsRepository(options);
-    this.postgresRunsRepository = new PostgresRunsRepository(options);
-    this.defaultRepository = options.defaultRepository ?? "clickhouse";
-    this.logger = options.logger ?? logger;
   }
 
   get name() {
     return "runsRepository";
   }
 
-  async #getRepository(): Promise<IRunsRepository> {
-    return startActiveSpan("runsRepository.getRepository", async (span) => {
-      const getFlag = makeFlag(this.options.prisma);
-      const runsListRepository = await getFlag({
-        key: FEATURE_FLAG.runsListRepository,
-        defaultValue: this.defaultRepository,
-      });
-
-      span.setAttribute("repository.name", runsListRepository);
-
-      logger.log("runsListRepository", { runsListRepository });
-
-      switch (runsListRepository) {
-        case "postgres":
-          return this.postgresRunsRepository;
-        case "clickhouse":
-        default:
-          return this.clickHouseRunsRepository;
-      }
-    });
-  }
-
-  async listRunIds(options: ListRunsOptions): Promise<string[]> {
-    const repository = await this.#getRepository();
+  async runExistsInEnvironment(options: {
+    organizationId: string;
+    projectId: string;
+    environmentId: string;
+    createdAtLowerBoundMs?: number;
+  }): Promise<boolean> {
     return startActiveSpan(
-      "runsRepository.listRunIds",
-      async () => {
-        try {
-          return await repository.listRunIds(options);
-        } catch (error) {
-          // If ClickHouse fails, retry with Postgres
-          if (repository.name === "clickhouse") {
-            this.logger?.warn("ClickHouse failed, retrying with Postgres", { error });
-            return startActiveSpan(
-              "runsRepository.listRunIds.fallback",
-              async () => {
-                return await this.postgresRunsRepository.listRunIds(options);
-              },
-              {
-                attributes: {
-                  "repository.name": "postgres",
-                  "fallback.reason": "clickhouse_error",
-                  "fallback.error": error instanceof Error ? error.message : String(error),
-                  organizationId: options.organizationId,
-                  projectId: options.projectId,
-                  environmentId: options.environmentId,
-                },
-              }
-            );
-          }
-          throw error;
-        }
-      },
+      "runsRepository.runExistsInEnvironment",
+      async () => this.clickHouseRunsRepository.runExistsInEnvironment(options),
       {
         attributes: {
-          "repository.name": repository.name,
+          "repository.name": "clickhouse",
+          organizationId: options.organizationId,
+          projectId: options.projectId,
+          environmentId: options.environmentId,
+        },
+      }
+    );
+  }
+
+  async listRunIds(options: ListRunsOptions): Promise<RunIdsPage> {
+    return startActiveSpan(
+      "runsRepository.listRunIds",
+      async () => this.clickHouseRunsRepository.listRunIds(options),
+      {
+        attributes: {
+          "repository.name": "clickhouse",
           organizationId: options.organizationId,
           projectId: options.projectId,
           environmentId: options.environmentId,
@@ -226,39 +278,13 @@ export class RunsRepository implements IRunsRepository {
   }
 
   async listFriendlyRunIds(options: ListRunsOptions): Promise<string[]> {
-    const repository = await this.#getRepository();
     return startActiveSpan(
       "runsRepository.listFriendlyRunIds",
-      async () => {
-        try {
-          return await repository.listFriendlyRunIds(options);
-        } catch (error) {
-          // If ClickHouse fails, retry with Postgres
-          if (repository.name === "clickhouse") {
-            this.logger?.warn("ClickHouse failed, retrying with Postgres", { error });
-            return startActiveSpan(
-              "runsRepository.listFriendlyRunIds.fallback",
-              async () => {
-                return await this.postgresRunsRepository.listFriendlyRunIds(options);
-              },
-              {
-                attributes: {
-                  "repository.name": "postgres",
-                  "fallback.reason": "clickhouse_error",
-                  "fallback.error": error instanceof Error ? error.message : String(error),
-                  organizationId: options.organizationId,
-                  projectId: options.projectId,
-                  environmentId: options.environmentId,
-                },
-              }
-            );
-          }
-          throw error;
-        }
-      },
+      async () => this.clickHouseRunsRepository.listFriendlyRunIds(options),
       {
         attributes: {
-          "repository.name": repository.name,
+          "repository.name": "clickhouse",
+          "readThrough.split": Boolean(this.options.readThrough?.splitEnabled),
           organizationId: options.organizationId,
           projectId: options.projectId,
           environmentId: options.environmentId,
@@ -274,39 +300,13 @@ export class RunsRepository implements IRunsRepository {
       previousCursor: string | null;
     };
   }> {
-    const repository = await this.#getRepository();
     return startActiveSpan(
       "runsRepository.listRuns",
-      async () => {
-        try {
-          return await repository.listRuns(options);
-        } catch (error) {
-          // If ClickHouse fails, retry with Postgres
-          if (repository.name === "clickhouse") {
-            this.logger?.warn("ClickHouse failed, retrying with Postgres", { error });
-            return startActiveSpan(
-              "runsRepository.listRuns.fallback",
-              async () => {
-                return await this.postgresRunsRepository.listRuns(options);
-              },
-              {
-                attributes: {
-                  "repository.name": "postgres",
-                  "fallback.reason": "clickhouse_error",
-                  "fallback.error": error instanceof Error ? error.message : String(error),
-                  organizationId: options.organizationId,
-                  projectId: options.projectId,
-                  environmentId: options.environmentId,
-                },
-              }
-            );
-          }
-          throw error;
-        }
-      },
+      async () => this.clickHouseRunsRepository.listRuns(options),
       {
         attributes: {
-          "repository.name": repository.name,
+          "repository.name": "clickhouse",
+          "readThrough.split": Boolean(this.options.readThrough?.splitEnabled),
           organizationId: options.organizationId,
           projectId: options.projectId,
           environmentId: options.environmentId,
@@ -316,39 +316,12 @@ export class RunsRepository implements IRunsRepository {
   }
 
   async countRuns(options: RunListInputOptions): Promise<number> {
-    const repository = await this.#getRepository();
     return startActiveSpan(
       "runsRepository.countRuns",
-      async () => {
-        try {
-          return await repository.countRuns(options);
-        } catch (error) {
-          // If ClickHouse fails, retry with Postgres
-          if (repository.name === "clickhouse") {
-            this.logger?.warn("ClickHouse failed, retrying with Postgres", { error });
-            return startActiveSpan(
-              "runsRepository.countRuns.fallback",
-              async () => {
-                return await this.postgresRunsRepository.countRuns(options);
-              },
-              {
-                attributes: {
-                  "repository.name": "postgres",
-                  "fallback.reason": "clickhouse_error",
-                  "fallback.error": error instanceof Error ? error.message : String(error),
-                  organizationId: options.organizationId,
-                  projectId: options.projectId,
-                  environmentId: options.environmentId,
-                },
-              }
-            );
-          }
-          throw error;
-        }
-      },
+      async () => this.clickHouseRunsRepository.countRuns(options),
       {
         attributes: {
-          "repository.name": repository.name,
+          "repository.name": "clickhouse",
           organizationId: options.organizationId,
           projectId: options.projectId,
           environmentId: options.environmentId,
@@ -358,15 +331,12 @@ export class RunsRepository implements IRunsRepository {
   }
 
   async listTags(options: TagListOptions): Promise<TagList> {
-    const repository = await this.#getRepository();
     return startActiveSpan(
       "runsRepository.listTags",
-      async () => {
-        return await repository.listTags(options);
-      },
+      async () => this.clickHouseRunsRepository.listTags(options),
       {
         attributes: {
-          "repository.name": repository.name,
+          "repository.name": "clickhouse",
           organizationId: options.organizationId,
           projectId: options.projectId,
           environmentId: options.environmentId,
@@ -382,7 +352,8 @@ export function parseRunListInputOptions(data: any): RunListInputOptions {
 
 export async function convertRunListInputOptionsToFilterRunsOptions(
   options: RunListInputOptions,
-  prisma: RunsRepositoryOptions["prisma"]
+  prisma: RunsRepositoryOptions["prisma"],
+  store: RunStore = defaultRunStore
 ): Promise<FilterRunsOptions> {
   const convertedOptions: FilterRunsOptions = {
     ...options,
@@ -395,26 +366,22 @@ export async function convertRunListInputOptionsToFilterRunsOptions(
     from: options.from,
     to: options.to,
   });
-  convertedOptions.period = time.period ? parseDuration(time.period) ?? undefined : undefined;
+  convertedOptions.period = time.period ? (parseDuration(time.period) ?? undefined) : undefined;
 
-  // Batch friendlyId to id
+  // Cross-DB resolution: BatchTaskRun is a RUN-OPS table. A run-ops batch resident on the
+  // dedicated run-ops DB must resolve via the store's NEW->LEGACY probe — a single control-plane
+  // client would miss it and leave the friendlyId in the ClickHouse `batch_id` filter, matching
+  // nothing. Split off / self-host: the store is a passthrough over the one client.
   if (options.batchId && options.batchId.startsWith("batch_")) {
-    const batch = await prisma.batchTaskRun.findFirst({
-      select: {
-        id: true,
-      },
-      where: {
-        friendlyId: options.batchId,
-        runtimeEnvironmentId: options.environmentId,
-      },
-    });
+    const batch = await store.findBatchTaskRunByFriendlyId(options.batchId, options.environmentId);
 
     if (batch) {
       convertedOptions.batchId = batch.id;
     }
   }
 
-  // ScheduleId can be a friendlyId
+  // ScheduleId can be a friendlyId. TaskSchedule is a CONTROL-PLANE table, so this stays on
+  // the passed `prisma` (the control-plane client) in both single-DB and split modes.
   if (options.scheduleId && options.scheduleId.startsWith("sched_")) {
     const schedule = await prisma.taskSchedule.findFirst({
       select: {
@@ -440,8 +407,9 @@ export async function convertRunListInputOptionsToFilterRunsOptions(
     convertedOptions.runId = options.runId.map((r) => RunId.toFriendlyId(r));
   }
 
-  // Show all runs if we are filtering by batchId or runId
-  if (options.batchId || options.runId?.length || options.scheduleId || options.tasks?.length) {
+  // batchId/runId/scheduleId target specific runs, so rootOnly is meaningless and forced off.
+  // tasks is intentionally excluded so rootOnly can narrow a task filter to root runs only.
+  if (options.batchId || options.runId?.length || options.scheduleId) {
     convertedOptions.rootOnly = false;
   }
 

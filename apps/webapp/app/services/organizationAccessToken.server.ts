@@ -1,58 +1,13 @@
-import { customAlphabet } from "nanoid";
 import { z } from "zod";
 import { prisma } from "~/db.server";
 import { logger } from "./logger.server";
 import { hashToken } from "~/utils/tokens.server";
 
-const tokenValueLength = 40;
-//lowercase only, removed 0 and l to avoid confusion
-const tokenGenerator = customAlphabet("123456789abcdefghijkmnopqrstuvwxyz", tokenValueLength);
-
-type CreateOrganizationAccessTokenOptions = {
-  name: string;
-  organizationId: string;
-  expiresAt?: Date;
-};
-
-export async function getValidOrganizationAccessTokens(organizationId: string) {
-  const organizationAccessTokens = await prisma.organizationAccessToken.findMany({
-    select: {
-      id: true,
-      name: true,
-      createdAt: true,
-      lastAccessedAt: true,
-      expiresAt: true,
-    },
-    where: {
-      organizationId,
-      revokedAt: null,
-      OR: [{ expiresAt: null }, { expiresAt: { gte: new Date() } }],
-    },
-  });
-
-  return organizationAccessTokens.map((oat) => ({
-    id: oat.id,
-    name: oat.name,
-    createdAt: oat.createdAt,
-    lastAccessedAt: oat.lastAccessedAt,
-    expiresAt: oat.expiresAt,
-  }));
-}
-
-export type ObfuscatedOrganizationAccessToken = Awaited<
-  ReturnType<typeof getValidOrganizationAccessTokens>
->[number];
-
-export async function revokeOrganizationAccessToken(tokenId: string) {
-  await prisma.organizationAccessToken.update({
-    where: {
-      id: tokenId,
-    },
-    data: {
-      revokedAt: new Date(),
-    },
-  });
-}
+// Skip the lastAccessedAt write if the existing value is already within this
+// window. Eliminates per-auth UPDATE churn on a small narrow hot table; the
+// settings UI reads this field at human granularity so a few-minute
+// staleness is fine.
+export const OAT_LAST_ACCESSED_THROTTLE_MS = 5 * 60 * 1000;
 
 export type OrganizationAccessTokenAuthenticationResult = {
   organizationId: string;
@@ -105,9 +60,19 @@ export async function authenticateOrganizationAccessToken(
     return;
   }
 
-  await prisma.organizationAccessToken.update({
+  // Conditional updateMany — only writes if the existing lastAccessedAt is
+  // null or older than the throttle window. The WHERE runs inside the UPDATE
+  // so concurrent auths don't race into a double-write. `revokedAt: null`
+  // matches the findFirst guard above so a token revoked between the read
+  // and write doesn't get a stale lastAccessedAt update.
+  await prisma.organizationAccessToken.updateMany({
     where: {
       id: organizationAccessToken.id,
+      revokedAt: null,
+      OR: [
+        { lastAccessedAt: null },
+        { lastAccessedAt: { lt: new Date(Date.now() - OAT_LAST_ACCESSED_THROTTLE_MS) } },
+      ],
     },
     data: {
       lastAccessedAt: new Date(),
@@ -123,37 +88,4 @@ export function isOrganizationAccessToken(token: string) {
   return token.startsWith(tokenPrefix);
 }
 
-export async function createOrganizationAccessToken({
-  name,
-  organizationId,
-  expiresAt,
-}: CreateOrganizationAccessTokenOptions) {
-  const token = createToken();
-
-  const organizationAccessToken = await prisma.organizationAccessToken.create({
-    data: {
-      name,
-      organizationId,
-      hashedToken: hashToken(token),
-      expiresAt,
-    },
-  });
-
-  return {
-    id: organizationAccessToken.id,
-    name,
-    organizationId,
-    token,
-    expiresAt: organizationAccessToken.expiresAt,
-  };
-}
-
-export type CreatedOrganizationAccessToken = Awaited<
-  ReturnType<typeof createOrganizationAccessToken>
->;
-
 const tokenPrefix = "tr_oat_";
-
-function createToken() {
-  return `${tokenPrefix}${tokenGenerator()}`;
-}

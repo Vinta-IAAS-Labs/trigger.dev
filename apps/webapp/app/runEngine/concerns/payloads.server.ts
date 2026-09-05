@@ -1,8 +1,9 @@
-import { IOPacket, packetRequiresOffloading, tryCatch } from "@trigger.dev/core/v3";
-import { PayloadProcessor, TriggerTaskRequest } from "../types";
+import type { IOPacket } from "@trigger.dev/core/v3";
+import { packetRequiresOffloading, tryCatch } from "@trigger.dev/core/v3";
+import type { PayloadProcessor, TriggerTaskRequest } from "../types";
 import { env } from "~/env.server";
 import { startActiveSpan } from "~/v3/tracer.server";
-import { uploadPacketToObjectStore } from "~/v3/r2.server";
+import { uploadPacketToObjectStore } from "~/v3/objectStore.server";
 import { ServiceValidationError } from "~/v3/services/common.server";
 
 export class DefaultPayloadProcessor implements PayloadProcessor {
@@ -23,7 +24,11 @@ export class DefaultPayloadProcessor implements PayloadProcessor {
       );
 
       span.setAttribute("needsOffloading", needsOffloading);
-      span.setAttribute("size", size);
+      // When the caller already offloaded the payload (payloadType "application/store"), the
+      // packet here is just the small object-store reference, so `size` measures the reference,
+      // not the payload. Prefer the caller-reported pre-offload size when it's provided so the
+      // span reflects the real payload size. For inline payloads the two agree.
+      span.setAttribute("size", request.body.options?.payloadSize ?? size);
 
       if (!needsOffloading) {
         return packet;
@@ -31,8 +36,14 @@ export class DefaultPayloadProcessor implements PayloadProcessor {
 
       const filename = `${request.friendlyId}/payload.json`;
 
-      const [uploadError] = await tryCatch(
-        uploadPacketToObjectStore(filename, packet.data, packet.dataType, request.environment)
+      const [uploadError, uploadedFilename] = await tryCatch(
+        uploadPacketToObjectStore(
+          filename,
+          packet.data,
+          packet.dataType,
+          request.environment,
+          env.OBJECT_STORE_DEFAULT_PROTOCOL
+        )
       );
 
       if (uploadError) {
@@ -40,7 +51,7 @@ export class DefaultPayloadProcessor implements PayloadProcessor {
       }
 
       return {
-        data: filename,
+        data: uploadedFilename!,
         dataType: "application/store",
       };
     });

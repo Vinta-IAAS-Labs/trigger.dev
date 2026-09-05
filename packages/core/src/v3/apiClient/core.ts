@@ -1,24 +1,24 @@
 import { z } from "zod";
-import { fromZodError, ValidationError } from "zod-validation-error";
-import { RetryOptions } from "../schemas/index.js";
+import { fromZodError } from "zod-validation-error";
+import type { RetryOptions } from "../schemas/index.js";
 import { calculateNextRetryDelay } from "../utils/retries.js";
 import { ApiConnectionError, ApiError, ApiSchemaValidationError } from "./errors.js";
 
-import { Attributes, context, propagation, Span, trace } from "@opentelemetry/api";
+import type { Attributes, Span } from "@opentelemetry/api";
+import { context, propagation } from "@opentelemetry/api";
 import { suppressTracing } from "@opentelemetry/core";
+import { EventSource, type ErrorEvent } from "eventsource";
 import { SemanticInternalAttributes } from "../semanticInternalAttributes.js";
 import type { TriggerTracer } from "../tracer.js";
+import { randomUUID } from "../utils/crypto.js";
 import { accessoryAttributes } from "../utils/styleAttributes.js";
-import {
-  CursorPage,
+import type {
   CursorPageParams,
   CursorPageResponse,
-  OffsetLimitPage,
   OffsetLimitPageParams,
   OffsetLimitPageResponse,
 } from "./pagination.js";
-import { EventSource, type ErrorEvent } from "eventsource";
-import { randomUUID } from "../utils/crypto.js";
+import { CursorPage, OffsetLimitPage } from "./pagination.js";
 
 export const defaultRetryOptions = {
   maxAttempts: 3,
@@ -40,7 +40,9 @@ export type ZodFetchOptions<TData = any> = {
 
 export type AnyZodFetchOptions = ZodFetchOptions<any>;
 
-export type ApiRequestOptions = Pick<ZodFetchOptions, "retry">;
+export type ApiRequestOptions = Pick<ZodFetchOptions, "retry"> & {
+  additionalHeaders?: Record<string, string>;
+};
 
 type KeysEnum<T> = { [P in keyof Required<T>]: true };
 
@@ -49,6 +51,7 @@ type KeysEnum<T> = { [P in keyof Required<T>]: true };
 // compiler such that any missing / extraneous keys will cause an error.
 const requestOptionsKeys: KeysEnum<ApiRequestOptions> = {
   retry: true,
+  additionalHeaders: true,
 };
 
 export const isRequestOptions = (obj: unknown): obj is ApiRequestOptions => {
@@ -271,9 +274,6 @@ async function _doZodFetchWithRetries<TResponseBodySchema extends z.ZodTypeAny>(
       throw error;
     }
 
-    if (error instanceof ValidationError) {
-    }
-
     if (options?.retry) {
       const retry = { ...defaultRetryOptions, ...options.retry };
 
@@ -293,7 +293,7 @@ async function _doZodFetchWithRetries<TResponseBodySchema extends z.ZodTypeAny>(
 async function safeJsonFromResponse(response: Response): Promise<any> {
   try {
     return await response.clone().json();
-  } catch (error) {
+  } catch (_error) {
     return;
   }
 }
@@ -374,7 +374,7 @@ function shouldRetry(
 function safeJsonParse(text: string): any {
   try {
     return JSON.parse(text);
-  } catch (e) {
+  } catch (_e) {
     return undefined;
   }
 }
@@ -404,7 +404,7 @@ function requestInitWithCache(requestInit?: RequestInit): RequestInit {
     const _ = new Request("http://localhost", withCache);
 
     return withCache;
-  } catch (error) {
+  } catch (_error) {
     return requestInit ?? {};
   }
 }
@@ -600,15 +600,17 @@ async function waitForRetry(
 }
 
 // https://stackoverflow.com/a/34491287
-export function isEmptyObj(obj: Object | null | undefined): boolean {
+export function isEmptyObj(obj: object | null | undefined): boolean {
   if (!obj) return true;
-  for (const _k in obj) return false;
+  for (const key in obj) {
+    if (Object.hasOwn(obj, key)) return false;
+  }
   return true;
 }
 
 // https://eslint.org/docs/latest/rules/no-prototype-builtins
-export function hasOwn(obj: Object, key: string): boolean {
-  return Object.prototype.hasOwnProperty.call(obj, key);
+export function hasOwn(obj: object, key: string): boolean {
+  return Object.hasOwn(obj, key);
 }
 
 // If the requestInit has a header x-trigger-worker = true, then we will do
@@ -722,6 +724,13 @@ export type ApiResult<TSuccessResult> =
   | {
       success: false;
       error: string;
+      /**
+       * HTTP status code, when the failure originated from an API response
+       * (e.g. 429 for rate limiting). Undefined for connection/transport
+       * errors that never reached the server. Lets callers distinguish
+       * transient failures worth retrying from fatal ones.
+       */
+      statusCode?: number;
     };
 
 export async function wrapZodFetch<T extends z.ZodTypeAny>(
@@ -751,6 +760,7 @@ export async function wrapZodFetch<T extends z.ZodTypeAny>(
       return {
         success: false,
         error: error.message,
+        statusCode: error.status,
       };
     } else if (error instanceof Error) {
       return {

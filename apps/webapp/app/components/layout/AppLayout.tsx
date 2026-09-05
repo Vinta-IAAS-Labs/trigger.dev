@@ -1,3 +1,4 @@
+import { forwardRef } from "react";
 import { cn } from "~/utils/cn";
 
 /** This container is used to surround the entire app, it correctly places the nav bar */
@@ -20,24 +21,34 @@ export function MainBody({ children }: { children: React.ReactNode }) {
 }
 
 /** This container should be placed around the content on a page */
-export function PageContainer({ children }: { children: React.ReactNode }) {
-  return <div className="grid h-full grid-rows-[auto_1fr] overflow-hidden">{children}</div>;
-}
-
-export function PageBody({
+export function PageContainer({
   children,
-  scrollable = true,
   className,
 }: {
   children: React.ReactNode;
-  scrollable?: boolean;
   className?: string;
 }) {
   return (
+    <div className={cn("grid h-full grid-rows-[auto_1fr] overflow-hidden", className)}>
+      {children}
+    </div>
+  );
+}
+
+export const PageBody = forwardRef<
+  HTMLDivElement,
+  {
+    children: React.ReactNode;
+    scrollable?: boolean;
+    className?: string;
+  }
+>(function PageBody({ children, scrollable = true, className }, ref) {
+  return (
     <div
+      ref={ref}
       className={cn(
         scrollable
-          ? "overflow-y-auto p-3 scrollbar-thin scrollbar-track-transparent scrollbar-thumb-charcoal-600"
+          ? "overflow-y-auto p-3 scrollbar-thin scrollbar-track-transparent scrollbar-thumb-surface-control"
           : "overflow-hidden",
         className
       )}
@@ -45,18 +56,31 @@ export function PageBody({
       {children}
     </div>
   );
-}
+});
 
 export function MainCenteredContainer({
   children,
   className,
+  variant = "default",
 }: {
   children: React.ReactNode;
   className?: string;
+  variant?: "default" | "onboarding";
 }) {
   return (
-    <div className="h-full w-full overflow-y-auto scrollbar-thin scrollbar-track-transparent scrollbar-thumb-charcoal-600">
-      <div className={cn("mx-auto mt-6 max-w-xs overflow-y-auto p-1 md:mt-[22vh]", className)}>
+    <div
+      className={cn(
+        "h-full w-full overflow-y-auto scrollbar-thin scrollbar-track-transparent scrollbar-thumb-surface-control",
+        variant === "onboarding" && "flex flex-col p-4 lg:p-0"
+      )}
+    >
+      <div
+        className={cn(
+          "mx-auto max-w-xs p-1",
+          variant === "onboarding" ? "m-auto lg:mx-auto lg:mb-0 lg:mt-[22vh]" : "mt-6 md:mt-[22vh]",
+          className
+        )}
+      >
         {children}
       </div>
     </div>
@@ -71,10 +95,10 @@ export function MainHorizontallyCenteredContainer({
   className?: string;
 }) {
   return (
-    <div className="w-full overflow-y-auto scrollbar-thin scrollbar-track-transparent scrollbar-thumb-charcoal-600">
+    <div className="w-full overflow-y-auto scrollbar-thin scrollbar-track-transparent scrollbar-thumb-surface-control">
       <div
         className={cn(
-          "mx-auto mt-6 max-w-lg overflow-y-auto p-1 scrollbar-thin scrollbar-track-transparent scrollbar-thumb-charcoal-600 md:mt-14",
+          "mx-auto mt-6 max-w-lg overflow-y-auto p-1 scrollbar-thin scrollbar-track-transparent scrollbar-thumb-surface-control md:mt-14",
           className
         )}
       >

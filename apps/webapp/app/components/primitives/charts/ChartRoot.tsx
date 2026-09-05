@@ -40,6 +40,8 @@ export type ChartRootProps = {
   onViewAllLegendItems?: () => void;
   /** When true, constrains legend to max 50% height with scrolling */
   legendScrollable?: boolean;
+  /** Additional className for the legend */
+  legendClassName?: string;
   /** When true, chart fills its parent container height and distributes space between chart and legend */
   fillContainer?: boolean;
   /** Content rendered between the chart and the legend */
@@ -87,6 +89,7 @@ export function ChartRoot({
   legendValueFormatter,
   onViewAllLegendItems,
   legendScrollable = false,
+  legendClassName,
   fillContainer = false,
   beforeLegend,
   children,
@@ -114,6 +117,7 @@ export function ChartRoot({
         legendValueFormatter={legendValueFormatter}
         onViewAllLegendItems={onViewAllLegendItems}
         legendScrollable={legendScrollable}
+        legendClassName={legendClassName}
         fillContainer={fillContainer}
         beforeLegend={beforeLegend}
       >
@@ -133,6 +137,7 @@ type ChartRootInnerProps = {
   legendValueFormatter?: (value: number) => string;
   onViewAllLegendItems?: () => void;
   legendScrollable?: boolean;
+  legendClassName?: string;
   fillContainer?: boolean;
   beforeLegend?: React.ReactNode;
   children: React.ComponentProps<typeof RechartsPrimitive.ResponsiveContainer>["children"];
@@ -148,6 +153,7 @@ function ChartRootInner({
   legendValueFormatter,
   onViewAllLegendItems,
   legendScrollable = false,
+  legendClassName,
   fillContainer = false,
   beforeLegend,
   children,
@@ -156,13 +162,7 @@ function ChartRootInner({
   const enableZoom = zoom !== null;
 
   return (
-    <div
-      className={cn(
-        "relative flex w-full flex-col",
-        fillContainer && "h-full",
-        className
-      )}
-    >
+    <div className={cn("relative flex w-full flex-col", fillContainer && "h-full", className)}>
       <div
         className={cn(
           fillContainer ? "min-h-0 flex-1" : "h-full w-full",
@@ -174,9 +174,9 @@ function ChartRootInner({
           config={config}
           className={cn(
             "h-full w-full",
-            fillContainer && "!aspect-auto",
+            fillContainer && "aspect-auto!",
             enableZoom &&
-            "[&_.recharts-surface]:cursor-crosshair [&_.recharts-wrapper]:cursor-crosshair"
+              "[&_.recharts-surface]:cursor-crosshair [&_.recharts-wrapper]:cursor-crosshair"
           )}
           style={fillContainer ? undefined : minHeight ? { minHeight } : undefined}
         >
@@ -193,6 +193,7 @@ function ChartRootInner({
           valueFormatter={legendValueFormatter}
           onViewAllLegendItems={onViewAllLegendItems}
           scrollable={legendScrollable}
+          className={legendClassName}
         />
       )}
     </div>
@@ -205,7 +206,7 @@ function ChartRootInner({
  * Useful for rendering "no data" states.
  */
 export function useHasNoData(): boolean {
-  const { data, dataKey, dataKeys } = useChartContext();
+  const { data, dataKey: _dataKey, dataKeys } = useChartContext();
 
   return useMemo(() => {
     if (data.length === 0) return true;

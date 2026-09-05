@@ -1,14 +1,16 @@
 import {
-  ProjectAlertChannel,
-  ProjectAlertType,
-  RuntimeEnvironmentType,
+  type ProjectAlertChannel,
+  type ProjectAlertType,
+  type RuntimeEnvironmentType,
 } from "@trigger.dev/database";
 import { nanoid } from "nanoid";
 import { env } from "~/env.server";
 import { findProjectByRef } from "~/models/project.server";
 import { encryptSecret } from "~/services/secrets/secretStore.server";
+import { alertsWorker } from "~/v3/alertsWorker.server";
 import { generateFriendlyId } from "~/v3/friendlyIdentifiers";
 import { BaseService, ServiceValidationError } from "../baseService.server";
+import { assertSafeWebhookUrl, UnsafeWebhookUrlError } from "./safeWebhookUrl.server";
 
 export type CreateAlertChannelOptions = {
   name: string;
@@ -45,6 +47,19 @@ export class CreateAlertChannelService extends BaseService {
       throw new ServiceValidationError("Project not found");
     }
 
+    // Validate webhook URLs here (not per-route) so every caller is covered.
+    // Delivery re-validates at connect time via safeWebhookFetch.
+    if (options.channel.type === "WEBHOOK") {
+      try {
+        await assertSafeWebhookUrl(options.channel.url);
+      } catch (error) {
+        if (error instanceof UnsafeWebhookUrlError) {
+          throw new ServiceValidationError(error.message);
+        }
+        throw error;
+      }
+    }
+
     const environmentTypes =
       options.environmentTypes.length === 0
         ? (["STAGING", "PRODUCTION"] satisfies RuntimeEnvironmentType[])
@@ -60,7 +75,7 @@ export class CreateAlertChannelService extends BaseService {
       : undefined;
 
     if (existingAlertChannel) {
-      return await this._prisma.projectAlertChannel.update({
+      const updated = await this._prisma.projectAlertChannel.update({
         where: { id: existingAlertChannel.id },
         data: {
           name: options.name,
@@ -68,8 +83,15 @@ export class CreateAlertChannelService extends BaseService {
           type: options.channel.type,
           properties: await this.#createProperties(options.channel),
           environmentTypes,
+          enabled: true,
         },
       });
+
+      if (options.alertTypes.includes("ERROR_GROUP")) {
+        await this.#scheduleErrorAlertEvaluation(project.id);
+      }
+
+      return updated;
     }
 
     const alertChannel = await this._prisma.projectAlertChannel.create({
@@ -82,12 +104,27 @@ export class CreateAlertChannelService extends BaseService {
         properties: await this.#createProperties(options.channel),
         enabled: true,
         deduplicationKey: options.deduplicationKey,
-        userProvidedDeduplicationKey: options.deduplicationKey ? true : false,
+        userProvidedDeduplicationKey: Boolean(options.deduplicationKey),
         environmentTypes,
       },
     });
 
+    if (options.alertTypes.includes("ERROR_GROUP")) {
+      await this.#scheduleErrorAlertEvaluation(project.id);
+    }
+
     return alertChannel;
+  }
+
+  async #scheduleErrorAlertEvaluation(projectId: string): Promise<void> {
+    await alertsWorker.enqueue({
+      id: `evaluateErrorAlerts:${projectId}`,
+      job: "v3.evaluateErrorAlerts",
+      payload: {
+        projectId,
+        scheduledAt: Date.now(),
+      },
+    });
   }
 
   async #createProperties(channel: CreateAlertChannelOptions["channel"]) {

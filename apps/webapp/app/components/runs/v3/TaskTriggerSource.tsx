@@ -1,6 +1,8 @@
-import { ClockIcon } from "@heroicons/react/20/solid";
 import type { TaskTriggerSource } from "@trigger.dev/database";
+import { ClockIcon } from "~/assets/icons/ClockIcon";
+import { CubeSparkleIcon } from "~/assets/icons/CubeSparkleIcon";
 import { TaskIconSmall } from "~/assets/icons/TaskIcon";
+import { WebhookIcon } from "~/assets/icons/WebhookIcon";
 import { cn } from "~/utils/cn";
 
 export function TaskTriggerSourceIcon({
@@ -12,11 +14,17 @@ export function TaskTriggerSourceIcon({
 }) {
   switch (source) {
     case "STANDARD": {
-      return <TaskIconSmall className="size-[1.125rem] min-w-[1.125rem] text-tasks" />;
+      return <TaskIconSmall className={cn("size-4.5 min-w-4.5 text-tasks", className)} />;
     }
     case "SCHEDULED": {
+      return <ClockIcon className={cn("size-4.5 min-w-4.5 text-schedules", className)} />;
+    }
+    case "AGENT": {
+      return <CubeSparkleIcon className={cn("size-4.5 min-w-4.5 text-agents", className)} />;
+    }
+    case "WEBHOOK": {
       return (
-        <ClockIcon className={cn("size-[1.125rem] min-w-[1.125rem] text-schedules", className)} />
+        <WebhookIcon className={cn("size-[1.125rem] min-w-[1.125rem] text-webhooks", className)} />
       );
     }
   }
@@ -29,6 +37,12 @@ export function taskTriggerSourceDescription(source: TaskTriggerSource) {
     }
     case "SCHEDULED": {
       return "Scheduled task";
+    }
+    case "AGENT": {
+      return "Agent task";
+    }
+    case "WEBHOOK": {
+      return "Webhook task";
     }
   }
 }

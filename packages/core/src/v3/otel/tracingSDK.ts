@@ -1,11 +1,5 @@
-import {
-  DiagConsoleLogger,
-  DiagLogLevel,
-  TraceFlags,
-  TracerProvider,
-  diag,
-  metrics,
-} from "@opentelemetry/api";
+import type { TracerProvider } from "@opentelemetry/api";
+import { DiagConsoleLogger, DiagLogLevel, TraceFlags, diag, metrics } from "@opentelemetry/api";
 import { logs } from "@opentelemetry/api-logs";
 import { TraceState } from "@opentelemetry/core";
 import { OTLPLogExporter } from "@opentelemetry/exporter-logs-otlp-http";
@@ -13,18 +7,16 @@ import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
 import { OTLPMetricExporter } from "@opentelemetry/exporter-metrics-otlp-http";
 import { HostMetrics } from "@opentelemetry/host-metrics";
 import { registerInstrumentations, type Instrumentation } from "@opentelemetry/instrumentation";
-import {
-  detectResources,
-  processDetector,
-  Resource,
-  resourceFromAttributes,
-} from "@opentelemetry/resources";
-import {
-  BatchLogRecordProcessor,
+import type { Resource } from "@opentelemetry/resources";
+import { detectResources, processDetector, resourceFromAttributes } from "@opentelemetry/resources";
+import type {
   LogRecordExporter,
   LogRecordProcessor,
-  LoggerProvider,
   ReadableLogRecord,
+} from "@opentelemetry/sdk-logs";
+import {
+  BatchLogRecordProcessor,
+  LoggerProvider,
   SimpleLogRecordProcessor,
 } from "@opentelemetry/sdk-logs";
 import {
@@ -34,13 +26,13 @@ import {
   type MetricReader,
   type PushMetricExporter,
 } from "@opentelemetry/sdk-metrics";
-import { RandomIdGenerator, SpanProcessor } from "@opentelemetry/sdk-trace-base";
+import type { SpanProcessor } from "@opentelemetry/sdk-trace-base";
+import { RandomIdGenerator } from "@opentelemetry/sdk-trace-base";
+import type { ReadableSpan, SpanExporter } from "@opentelemetry/sdk-trace-node";
 import {
   BatchSpanProcessor,
   NodeTracerProvider,
-  ReadableSpan,
   SimpleSpanProcessor,
-  SpanExporter,
 } from "@opentelemetry/sdk-trace-node";
 import { VERSION } from "../../version.js";
 import {
@@ -108,6 +100,7 @@ export class TracingSDK {
   private readonly _spanExporter: SpanExporter;
   private readonly _traceProvider: NodeTracerProvider;
   private readonly _meterProvider: MeterProvider;
+  private readonly _metricReaders: MetricReader[];
 
   public readonly getLogger: LoggerProvider["getLogger"];
   public readonly getTracer: TracerProvider["getTracer"];
@@ -170,30 +163,25 @@ export class TracingSDK {
       )
     );
 
-    const externalTraceId = idGenerator.generateTraceId();
-    const externalTraceContext = traceContext.getExternalTraceContext();
+    // Shared by every wrapper below so a run's spans and logs agree on the id.
+    const fallbackTraceIds = new FallbackExternalTraceIds(idGenerator.generateTraceId());
 
     for (const exporter of config.exporters ?? []) {
       spanProcessors.push(
         getEnvVar("TRIGGER_OTEL_BATCH_PROCESSING_ENABLED") === "1"
-          ? new BatchSpanProcessor(
-              new ExternalSpanExporterWrapper(exporter, externalTraceId, externalTraceContext),
-              {
-                maxExportBatchSize: parseInt(
-                  getEnvVar("TRIGGER_OTEL_SPAN_MAX_EXPORT_BATCH_SIZE") ?? "64"
-                ),
-                scheduledDelayMillis: parseInt(
-                  getEnvVar("TRIGGER_OTEL_SPAN_SCHEDULED_DELAY_MILLIS") ?? "200"
-                ),
-                exportTimeoutMillis: parseInt(
-                  getEnvVar("TRIGGER_OTEL_SPAN_EXPORT_TIMEOUT_MILLIS") ?? "30000"
-                ),
-                maxQueueSize: parseInt(getEnvVar("TRIGGER_OTEL_SPAN_MAX_QUEUE_SIZE") ?? "512"),
-              }
-            )
-          : new SimpleSpanProcessor(
-              new ExternalSpanExporterWrapper(exporter, externalTraceId, externalTraceContext)
-            )
+          ? new BatchSpanProcessor(new ExternalSpanExporterWrapper(exporter, fallbackTraceIds), {
+              maxExportBatchSize: parseInt(
+                getEnvVar("TRIGGER_OTEL_SPAN_MAX_EXPORT_BATCH_SIZE") ?? "64"
+              ),
+              scheduledDelayMillis: parseInt(
+                getEnvVar("TRIGGER_OTEL_SPAN_SCHEDULED_DELAY_MILLIS") ?? "200"
+              ),
+              exportTimeoutMillis: parseInt(
+                getEnvVar("TRIGGER_OTEL_SPAN_EXPORT_TIMEOUT_MILLIS") ?? "30000"
+              ),
+              maxQueueSize: parseInt(getEnvVar("TRIGGER_OTEL_SPAN_MAX_QUEUE_SIZE") ?? "512"),
+            })
+          : new SimpleSpanProcessor(new ExternalSpanExporterWrapper(exporter, fallbackTraceIds))
       );
     }
 
@@ -245,11 +233,7 @@ export class TracingSDK {
       logProcessors.push(
         getEnvVar("TRIGGER_OTEL_BATCH_PROCESSING_ENABLED") === "1"
           ? new BatchLogRecordProcessor(
-              new ExternalLogRecordExporterWrapper(
-                externalLogExporter,
-                externalTraceId,
-                externalTraceContext
-              ),
+              new ExternalLogRecordExporterWrapper(externalLogExporter, fallbackTraceIds),
               {
                 maxExportBatchSize: parseInt(
                   getEnvVar("TRIGGER_OTEL_LOG_MAX_EXPORT_BATCH_SIZE") ?? "64"
@@ -264,11 +248,7 @@ export class TracingSDK {
               }
             )
           : new SimpleLogRecordProcessor(
-              new ExternalLogRecordExporterWrapper(
-                externalLogExporter,
-                externalTraceId,
-                externalTraceContext
-              )
+              new ExternalLogRecordExporterWrapper(externalLogExporter, fallbackTraceIds)
             )
       );
     }
@@ -291,9 +271,7 @@ export class TracingSDK {
 
     // Metrics setup
     const metricsUrl =
-      config.metricsUrl ??
-      getEnvVar("TRIGGER_OTEL_METRICS_ENDPOINT") ??
-      `${config.url}/v1/metrics`;
+      config.metricsUrl ?? getEnvVar("TRIGGER_OTEL_METRICS_ENDPOINT") ?? `${config.url}/v1/metrics`;
 
     const rawMetricExporter = new OTLPMetricExporter({
       url: metricsUrl,
@@ -342,6 +320,7 @@ export class TracingSDK {
     });
 
     this._meterProvider = meterProvider;
+    this._metricReaders = metricReaders;
     metrics.setGlobalMeterProvider(meterProvider);
 
     if (config.hostMetrics) {
@@ -372,15 +351,44 @@ export class TracingSDK {
     await Promise.all([
       this._traceProvider.forceFlush(),
       this._logProvider.forceFlush(),
-      this._meterProvider.forceFlush(),
+      this._flushMetricReadersSerially(),
     ]);
+  }
+
+  private async _flushMetricReadersSerially() {
+    await this._eachMetricReaderSerially("flush", (reader) => reader.forceFlush());
+  }
+
+  private async _shutdownMetricReadersSerially() {
+    await this._eachMetricReaderSerially("shut down", (reader) => reader.shutdown());
+    await this._meterProvider.shutdown();
+  }
+
+  private async _eachMetricReaderSerially(
+    action: string,
+    run: (reader: MetricReader) => Promise<void>
+  ) {
+    const errors: unknown[] = [];
+
+    for (const reader of this._metricReaders) {
+      try {
+        await run(reader);
+      } catch (error) {
+        console.error(`Failed to ${action} metric reader ${reader.constructor.name}`, error);
+        errors.push(error);
+      }
+    }
+
+    if (errors.length > 0) {
+      throw errors[0];
+    }
   }
 
   public async shutdown() {
     await Promise.all([
       this._traceProvider.shutdown(),
       this._logProvider.shutdown(),
-      this._meterProvider.shutdown(),
+      this._shutdownMetricReadersSerially(),
     ]);
   }
 }
@@ -417,23 +425,94 @@ function setLogLevel(level: TracingDiagnosticLogLevel) {
   diag.setLogger(new DiagConsoleLogger(), diagLogLevel);
 }
 
-class ExternalSpanExporterWrapper {
-  private readonly _isExternallySampled: boolean;
+/** Only the current run and the tail of recently ended ones can still export. */
+export const MAX_TRACKED_INTERNAL_TRACES = 64;
+
+/**
+ * External trace ids for runs that carry no external trace context — with
+ * `processKeepAlive` the `TracingSDK` outlives the run, so an id captured at
+ * construction merges every run on the process into one trace.
+ *
+ * A record's id comes from its own internal trace id rather than from whatever
+ * run is current when the exporter is called. Batch processors drain
+ * asynchronously, so a run's records are routinely exported after the next run
+ * has started, and reading ambient state then would stamp them with the wrong
+ * run's id. It also makes a run's spans and logs agree without coordinating.
+ *
+ * Granularity therefore follows the internal trace, not the run: a run tree
+ * shares one internal trace, so a parent and the runs it triggers land on one
+ * external trace together, which is the grouping you want.
+ */
+export class FallbackExternalTraceIds {
+  private readonly byInternalTrace = new Map<string, string>();
 
   constructor(
-    private underlyingExporter: SpanExporter,
-    private externalTraceId: string,
-    private externalTraceContext:
-      | { traceId: string; spanId: string; traceFlags: number; tracestate?: string }
-      | undefined
-  ) {
-    this._isExternallySampled = externalTraceContext
-      ? isTraceFlagSampled(externalTraceContext.traceFlags)
-      : !!externalTraceId;
+    private seed: string,
+    private traceIdGenerator: Pick<RandomIdGenerator, "generateTraceId"> = idGenerator
+  ) {}
+
+  /** False when no external trace id was configured, i.e. external export is off. */
+  get enabled(): boolean {
+    return !!this.seed;
   }
 
+  forInternalTrace(internalTraceId: string): string {
+    // An empty seed means external export is disabled — leave it that way
+    // rather than minting an id and switching the feature on.
+    if (!this.seed) {
+      return this.seed;
+    }
+
+    const known = this.byInternalTrace.get(internalTraceId);
+
+    if (known) {
+      // Re-insert so the map is ordered by last use rather than first. A run
+      // that is still exporting keeps its id even if enough unrelated traces
+      // appear alongside it to fill the map, which would otherwise split it
+      // across two external traces.
+      this.byInternalTrace.delete(internalTraceId);
+      this.byInternalTrace.set(internalTraceId, known);
+
+      return known;
+    }
+
+    // The first run reuses the id generated at construction, so the configured
+    // seed is not thrown away.
+    const traceId =
+      this.byInternalTrace.size === 0 ? this.seed : this.traceIdGenerator.generateTraceId();
+
+    this.byInternalTrace.set(internalTraceId, traceId);
+
+    if (this.byInternalTrace.size > MAX_TRACKED_INTERNAL_TRACES) {
+      // Map iterates in insertion order, so this drops the least recently used.
+      const stalest = this.byInternalTrace.keys().next().value;
+
+      if (stalest !== undefined) {
+        this.byInternalTrace.delete(stalest);
+      }
+    }
+
+    return traceId;
+  }
+}
+
+export class ExternalSpanExporterWrapper {
+  constructor(
+    private underlyingExporter: SpanExporter,
+    private fallback: FallbackExternalTraceIds
+  ) {}
+
   private transformSpan(span: ReadableSpan): ReadableSpan | undefined {
-    if (!this._isExternallySampled) {
+    // Read external context live, so per-run reassignment of
+    // standardTraceContextManager.traceContext is honoured on warm-started
+    // workers that reuse a single TracingSDK across runs.
+    const externalTraceContext = traceContext.getExternalTraceContext();
+
+    const isExternallySampled = externalTraceContext
+      ? isTraceFlagSampled(externalTraceContext.traceFlags)
+      : this.fallback.enabled;
+
+    if (!isExternallySampled) {
       return;
     }
 
@@ -441,9 +520,9 @@ class ExternalSpanExporterWrapper {
       return;
     }
 
-    const externalTraceId = this.externalTraceContext
-      ? this.externalTraceContext.traceId
-      : this.externalTraceId;
+    const externalTraceId = externalTraceContext
+      ? externalTraceContext.traceId
+      : this.fallback.forInternalTrace(span.spanContext().traceId);
 
     const isAttemptSpan = span.attributes[SemanticInternalAttributes.SPAN_ATTEMPT];
 
@@ -457,15 +536,15 @@ class ExternalSpanExporterWrapper {
       };
     }
 
-    if (isAttemptSpan && this.externalTraceContext) {
+    if (isAttemptSpan && externalTraceContext) {
       parentSpanContext = {
         ...parentSpanContext,
         traceId: externalTraceId,
-        spanId: this.externalTraceContext.spanId,
-        traceState: this.externalTraceContext.tracestate
-          ? new TraceState(this.externalTraceContext.tracestate)
+        spanId: externalTraceContext.spanId,
+        traceState: externalTraceContext.tracestate
+          ? new TraceState(externalTraceContext.tracestate)
           : undefined,
-        traceFlags: this.externalTraceContext.traceFlags,
+        traceFlags: externalTraceContext.traceFlags,
       };
     } else if (isAttemptSpan) {
       parentSpanContext = undefined;
@@ -501,29 +580,26 @@ class ExternalSpanExporterWrapper {
   }
 }
 
-class ExternalLogRecordExporterWrapper {
-  private readonly _isExternallySampled: boolean;
-
+export class ExternalLogRecordExporterWrapper {
   constructor(
     private underlyingExporter: LogRecordExporter,
-    private externalTraceId: string,
-    private externalTraceContext:
-      | { traceId: string; spanId: string; tracestate?: string; traceFlags: number }
-      | undefined
-  ) {
-    this._isExternallySampled = externalTraceContext
-      ? isTraceFlagSampled(externalTraceContext.traceFlags)
-      : !!externalTraceId;
-  }
+    private fallback: FallbackExternalTraceIds
+  ) {}
 
   export(logs: any[], resultCallback: (result: any) => void): void {
-    if (!this._isExternallySampled) {
+    const externalTraceContext = traceContext.getExternalTraceContext();
+
+    const isExternallySampled = externalTraceContext
+      ? isTraceFlagSampled(externalTraceContext.traceFlags)
+      : this.fallback.enabled;
+
+    if (!isExternallySampled) {
       this.underlyingExporter.export([], resultCallback);
 
       return;
     }
 
-    const modifiedLogs = logs.map(this.transformLogRecord.bind(this));
+    const modifiedLogs = logs.map((log) => this.transformLogRecord(log, externalTraceContext));
 
     this.underlyingExporter.export(modifiedLogs, resultCallback);
   }
@@ -532,15 +608,34 @@ class ExternalLogRecordExporterWrapper {
     return this.underlyingExporter.shutdown();
   }
 
-  transformLogRecord(logRecord: ReadableLogRecord): ReadableLogRecord {
-    // Capture externalTraceId for use within the proxy's scope.
-    // Use externalTraceContext.traceId if available, otherwise fall back to generated externalTraceId
-    const externalTraceId = this.externalTraceContext
-      ? this.externalTraceContext.traceId
-      : this.externalTraceId;
+  forceFlush(): Promise<void> {
+    const underlyingExporter = this.underlyingExporter as LogRecordExporter & {
+      forceFlush?: () => Promise<void>;
+    };
 
-    // If there's no spanContext, or if the externalTraceId is not set, return the original logRecord.
-    if (!logRecord.spanContext || !externalTraceId) {
+    return underlyingExporter.forceFlush ? underlyingExporter.forceFlush() : Promise.resolve();
+  }
+
+  transformLogRecord(
+    logRecord: ReadableLogRecord,
+    externalTraceContext:
+      | { traceId: string; spanId: string; tracestate?: string; traceFlags: number }
+      | undefined
+  ): ReadableLogRecord {
+    // Without a spanContext there is no internal trace id to key the fallback
+    // on, and nothing to rewrite.
+    if (!logRecord.spanContext) {
+      return logRecord;
+    }
+
+    // Capture externalTraceId for use within the proxy's scope. Use
+    // externalTraceContext.traceId if available, otherwise the id belonging to
+    // the run this record came from.
+    const externalTraceId = externalTraceContext
+      ? externalTraceContext.traceId
+      : this.fallback.forInternalTrace(logRecord.spanContext.traceId);
+
+    if (!externalTraceId) {
       return logRecord;
     }
 
@@ -607,7 +702,7 @@ function safeParseUrl(url: unknown): URL | undefined {
 
   try {
     return new URL(url);
-  } catch (e) {
+  } catch (_e) {
     return undefined;
   }
 }
@@ -639,7 +734,7 @@ function isValidAndNotEmpty(name: string | undefined): boolean {
   return isValid(name) && name.length > 0;
 }
 
-export function parseOtelResourceAttributes(
+function parseOtelResourceAttributes(
   rawEnvAttributes: string | undefined | null
 ): Record<string, string> {
   if (!rawEnvAttributes) return {};

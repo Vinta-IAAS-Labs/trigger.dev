@@ -1,21 +1,31 @@
+import { MachinePresetName, parsePacket, RunStatus } from "@trigger.dev/core/v3";
 import {
-  type ListRunResponse,
-  type ListRunResponseItem,
-  MachinePresetName,
-  parsePacket,
-  RunStatus,
-} from "@trigger.dev/core/v3";
-import { type Project, type RuntimeEnvironment, type TaskRunStatus } from "@trigger.dev/database";
+  type Project,
+  type RuntimeEnvironment,
+  type TaskRunStatus,
+  boundedIn,
+} from "@trigger.dev/database";
 import assertNever from "assert-never";
 import { z } from "zod";
-import { API_VERSIONS, RunStatusUnspecifiedApiVersion } from "~/api/versions";
-import { clickhouseClient } from "~/services/clickhouseInstance.server";
+import type { API_VERSIONS } from "~/api/versions";
+import { RunStatusUnspecifiedApiVersion } from "~/api/versions";
+import type { PrismaClientOrTransaction } from "~/db.server";
+import { clickhouseFactory } from "~/services/clickhouse/clickhouseFactoryInstance.server";
 import { logger } from "~/services/logger.server";
 import { CoercedDate } from "~/utils/zod";
 import { ServiceValidationError } from "~/v3/services/baseService.server";
 import { ApiRetrieveRunPresenter } from "./ApiRetrieveRunPresenter.server";
 import { NextRunListPresenter, type RunListOptions } from "./NextRunListPresenter.server";
 import { BasePresenter } from "./basePresenter.server";
+
+// Forwarded verbatim into `NextRunListPresenter` for the routed run-ops (TaskRun) reads. When
+// omitted, both clients default to the inherited `_replica` => passthrough single-DB. The
+// control-plane `runtimeEnvironment.findMany` env-scoping lookup is never routed.
+type ApiRunListPresenterReadThroughDeps = {
+  newClient?: PrismaClientOrTransaction;
+  legacyReplica?: PrismaClientOrTransaction;
+  splitEnabled?: boolean;
+};
 
 export const ApiRunListSearchParams = z.object({
   "page[size]": z.coerce.number().int().positive().min(1).max(100).optional(),
@@ -83,6 +93,8 @@ export const ApiRunListSearchParams = z.object({
     }),
   "filter[bulkAction]": z.string().optional(),
   "filter[schedule]": z.string().optional(),
+  // An `error_<fingerprint>` id — lists the runs behind an error group.
+  "filter[error]": z.string().optional(),
   "filter[isTest]": z
     .string()
     .optional()
@@ -111,6 +123,12 @@ export const ApiRunListSearchParams = z.object({
   "filter[createdAt][period]": z.string().optional(),
   "filter[batch]": z.string().optional(),
   "filter[queue]": z
+    .string()
+    .optional()
+    .transform((value) => {
+      return value ? value.split(",") : undefined;
+    }),
+  "filter[region]": z
     .string()
     .optional()
     .transform((value) => {
@@ -148,15 +166,24 @@ export const ApiRunListSearchParams = z.object({
 type ApiRunListSearchParams = z.infer<typeof ApiRunListSearchParams>;
 
 export class ApiRunListPresenter extends BasePresenter {
+  constructor(
+    prismaClient?: PrismaClientOrTransaction,
+    replicaClient?: PrismaClientOrTransaction,
+    private readonly readThroughDeps?: ApiRunListPresenterReadThroughDeps
+  ) {
+    super(prismaClient, replicaClient);
+  }
+
   public async call(
-    project: Project,
+    project: Pick<Project, "id">,
     searchParams: ApiRunListSearchParams,
     apiVersion: API_VERSIONS,
-    environment?: RuntimeEnvironment
+    environment?: Pick<RuntimeEnvironment, "id" | "organizationId">
   ) {
     return this.trace("call", async (span) => {
       const options: RunListOptions = {
         projectId: project.id,
+        columns: { visibleStandardIds: [], smartSources: ["metadata"] },
       };
 
       // pagination
@@ -187,7 +214,7 @@ export class ApiRunListPresenter extends BasePresenter {
             where: {
               projectId: project.id,
               slug: {
-                in: searchParams["filter[env]"],
+                in: boundedIn(searchParams["filter[env]"]),
               },
             },
           });
@@ -231,6 +258,10 @@ export class ApiRunListPresenter extends BasePresenter {
         options.scheduleId = searchParams["filter[schedule]"];
       }
 
+      if (searchParams["filter[error]"]) {
+        options.errorId = searchParams["filter[error]"];
+      }
+
       if (searchParams["filter[createdAt][from]"]) {
         options.from = searchParams["filter[createdAt][from]"].getTime();
       }
@@ -255,11 +286,19 @@ export class ApiRunListPresenter extends BasePresenter {
         options.queues = searchParams["filter[queue]"];
       }
 
+      if (searchParams["filter[region]"]) {
+        options.regions = searchParams["filter[region]"];
+      }
+
       if (searchParams["filter[machine]"]) {
         options.machines = searchParams["filter[machine]"];
       }
 
-      const presenter = new NextRunListPresenter(this._replica, clickhouseClient);
+      const clickhouse = await clickhouseFactory.getClickhouseForOrganization(
+        organizationId,
+        "runsList"
+      );
+      const presenter = new NextRunListPresenter(this._replica, clickhouse, this.readThroughDeps);
 
       logger.debug("Calling RunListPresenter", { options });
 
@@ -272,7 +311,7 @@ export class ApiRunListPresenter extends BasePresenter {
           const metadata = await parsePacket(
             {
               data: run.metadata ?? undefined,
-              dataType: run.metadataType,
+              dataType: run.metadataType ?? "application/json",
             },
             {
               filteredKeys: ["$$streams", "$$streamsVersion", "$$streamsBaseUrl"],
@@ -304,6 +343,11 @@ export class ApiRunListPresenter extends BasePresenter {
             durationMs: run.usageDurationMs,
             depth: run.depth,
             metadata,
+            // ClickHouse defaults `task_kind` to "" for pre-migration rows.
+            // Match `NextRunListPresenter`'s "STANDARD" fallback so API
+            // consumers and the dashboard see the same value.
+            taskKind: run.taskKind || "STANDARD",
+            region: run.region ?? undefined,
             ...ApiRetrieveRunPresenter.apiBooleanHelpersFromRunStatus(
               ApiRetrieveRunPresenter.apiStatusFromRunStatus(run.status, apiVersion)
             ),

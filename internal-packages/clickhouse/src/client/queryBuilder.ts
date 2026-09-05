@@ -1,6 +1,6 @@
 import { z } from "zod";
-import { ClickhouseQueryFunction, ClickhouseReader, ColumnExpression } from "./types.js";
-import { ClickHouseSettings } from "@clickhouse/client";
+import type { ClickhouseQueryFunction, ClickhouseReader, ColumnExpression } from "./types.js";
+import type { ClickHouseSettings } from "@clickhouse/client";
 export type QueryParamValue = string | number | boolean | Array<string | number | boolean> | null;
 export type QueryParams = Record<string, QueryParamValue>;
 
@@ -12,7 +12,9 @@ export type WhereCondition = {
 export class ClickhouseQueryBuilder<TOutput> {
   private name: string;
   private baseQuery: string;
+  private prewhereClauses: string[] = [];
   private whereClauses: string[] = [];
+  private havingClauses: string[] = [];
   private params: QueryParams = {};
   private orderByClause: string | null = null;
   private limitClause: string | null = null;
@@ -33,6 +35,34 @@ export class ClickhouseQueryBuilder<TOutput> {
     this.reader = reader;
     this.schema = schema;
     this.settings = settings;
+  }
+
+  /** Set query parameters without adding a WHERE clause. Use for base queries with inline params. */
+  setParams(params: QueryParams): this {
+    Object.assign(this.params, params);
+    return this;
+  }
+
+  /**
+   * Adds a PREWHERE clause. On a `... FINAL` base query, only use this for columns that are
+   * immutable or additive across a run's versions (e.g. task_identifier, tags): PREWHERE filters
+   * rows before FINAL reconciles versions, so a mutable column (e.g. status) would keep a stale
+   * version and drop the winning one. It filters before materialising the wide columns, which is
+   * what bounds memory on `task_runs_v2 FINAL` scans.
+   */
+  prewhere(clause: string, params?: QueryParams): this {
+    this.prewhereClauses.push(clause);
+    if (params) {
+      Object.assign(this.params, params);
+    }
+    return this;
+  }
+
+  prewhereIf(condition: any, clause: string, params?: QueryParams): this {
+    if (condition) {
+      this.prewhere(clause, params);
+    }
+    return this;
   }
 
   where(clause: string, params?: QueryParams): this {
@@ -69,6 +99,21 @@ export class ClickhouseQueryBuilder<TOutput> {
     return this;
   }
 
+  having(clause: string, params?: QueryParams): this {
+    this.havingClauses.push(clause);
+    if (params) {
+      Object.assign(this.params, params);
+    }
+    return this;
+  }
+
+  havingIf(condition: any, clause: string, params?: QueryParams): this {
+    if (condition) {
+      this.having(clause, params);
+    }
+    return this;
+  }
+
   orderBy(clause: string): this {
     this.orderByClause = clause;
     return this;
@@ -95,11 +140,17 @@ export class ClickhouseQueryBuilder<TOutput> {
 
   build(): { query: string; params: QueryParams } {
     let query = this.baseQuery;
+    if (this.prewhereClauses.length > 0) {
+      query += " PREWHERE " + this.prewhereClauses.join(" AND ");
+    }
     if (this.whereClauses.length > 0) {
       query += " WHERE " + this.whereClauses.join(" AND ");
     }
     if (this.groupByClause) {
       query += ` GROUP BY ${this.groupByClause}`;
+    }
+    if (this.havingClauses.length > 0) {
+      query += " HAVING " + this.havingClauses.join(" AND ");
     }
     if (this.orderByClause) {
       query += ` ORDER BY ${this.orderByClause}`;
@@ -119,6 +170,7 @@ export class ClickhouseQueryFastBuilder<TOutput extends Record<string, any>> {
   private settings: ClickHouseSettings | undefined;
   private prewhereClauses: string[] = [];
   private whereClauses: string[] = [];
+  private havingClauses: string[] = [];
   private params: QueryParams = {};
   private orderByClause: string | null = null;
   private limitClause: string | null = null;
@@ -191,6 +243,21 @@ export class ClickhouseQueryFastBuilder<TOutput extends Record<string, any>> {
     return this;
   }
 
+  having(clause: string, params?: QueryParams): this {
+    this.havingClauses.push(clause);
+    if (params) {
+      Object.assign(this.params, params);
+    }
+    return this;
+  }
+
+  havingIf(condition: any, clause: string, params?: QueryParams): this {
+    if (condition) {
+      this.having(clause, params);
+    }
+    return this;
+  }
+
   orderBy(clause: string): this {
     this.orderByClause = clause;
     return this;
@@ -214,6 +281,24 @@ export class ClickhouseQueryFastBuilder<TOutput extends Record<string, any>> {
     return queryFunction(params);
   }
 
+  /**
+   * Like {@link execute} but streams rows instead of buffering them into an
+   * array. Returns an async iterable so the whole result set is never resident
+   * in memory at once.
+   */
+  executeStream(): AsyncIterable<TOutput> {
+    const { query, params } = this.build();
+
+    const streamFunction = this.reader.queryFastStream<TOutput, Record<string, any>>({
+      name: this.name,
+      query,
+      columns: this.columns,
+      settings: this.settings,
+    });
+
+    return streamFunction(params);
+  }
+
   build(): { query: string; params: QueryParams } {
     let query = `SELECT ${this.buildColumns().join(", ")} FROM ${this.table}`;
     if (this.prewhereClauses.length > 0) {
@@ -224,6 +309,9 @@ export class ClickhouseQueryFastBuilder<TOutput extends Record<string, any>> {
     }
     if (this.groupByClause) {
       query += ` GROUP BY ${this.groupByClause}`;
+    }
+    if (this.havingClauses.length > 0) {
+      query += " HAVING " + this.havingClauses.join(" AND ");
     }
     if (this.orderByClause) {
       query += ` ORDER BY ${this.orderByClause}`;

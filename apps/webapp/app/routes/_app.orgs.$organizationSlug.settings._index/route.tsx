@@ -1,16 +1,18 @@
 import colorWheelIcon from "../../assets/images/color-wheel.png";
-import { conform, useForm } from "@conform-to/react";
-import { parse } from "@conform-to/zod";
+import { getFormProps, getInputProps, useForm } from "@conform-to/react";
+import { conformZodMessage, parseWithZod } from "@conform-to/zod";
 import {
   CheckIcon,
   ExclamationTriangleIcon,
   FolderIcon,
   TrashIcon,
 } from "@heroicons/react/20/solid";
-import { Form, type MetaFunction, useActionData, useNavigation } from "@remix-run/react";
-import { type ActionFunction, json, type LoaderFunctionArgs } from "@remix-run/server-runtime";
+import { Form, useActionData, useNavigation, useSubmit } from "@remix-run/react";
+import { json, type LoaderFunctionArgs } from "@remix-run/server-runtime";
+import { useEffect, useRef, useState } from "react";
 import { redirect, typedjson, useTypedLoaderData } from "remix-typedjson";
 import { z } from "zod";
+import { GlobeLinesIcon } from "~/assets/icons/GlobeLinesIcon";
 import { InlineCode } from "~/components/code/InlineCode";
 import {
   MainHorizontallyCenteredContainer,
@@ -26,46 +28,35 @@ import {
   parseAvatar,
   defaultAvatarHex,
   defaultAvatarColors,
+  type Avatar as AvatarT,
 } from "~/components/primitives/Avatar";
 import { Button } from "~/components/primitives/Buttons";
 import { Fieldset } from "~/components/primitives/Fieldset";
 import { FormButtons } from "~/components/primitives/FormButtons";
 import { FormError } from "~/components/primitives/FormError";
-import { Header2, Header3 } from "~/components/primitives/Headers";
+import { Header2 } from "~/components/primitives/Headers";
 import { Hint } from "~/components/primitives/Hint";
 import { Input } from "~/components/primitives/Input";
 import { InputGroup } from "~/components/primitives/InputGroup";
 import { Label } from "~/components/primitives/Label";
 import { NavBar, PageTitle } from "~/components/primitives/PageHeader";
-import {
-  Popover,
-  PopoverContent,
-  PopoverCustomTrigger,
-  PopoverTrigger,
-} from "~/components/primitives/Popover";
-import { Spinner, SpinnerWhite } from "~/components/primitives/Spinner";
+import { Popover, PopoverContent, PopoverTrigger } from "~/components/primitives/Popover";
+import { SpinnerWhite } from "~/components/primitives/Spinner";
 import { prisma } from "~/db.server";
-import { useOrganization } from "~/hooks/useOrganizations";
+import { useFaviconUrl } from "~/hooks/useFaviconUrl";
 import { redirectWithErrorMessage, redirectWithSuccessMessage } from "~/models/message.server";
+import { resolveOrgIdFromSlug } from "~/models/organization.server";
 import { clearCurrentProject } from "~/services/dashboardPreferences.server";
 import { DeleteOrganizationService } from "~/services/deleteOrganization.server";
 import { logger } from "~/services/logger.server";
 import { requireUser, requireUserId } from "~/services/session.server";
+import { dashboardAction } from "~/services/routeBuilders/dashboardBuilder";
 import { cn } from "~/utils/cn";
-import {
-  OrganizationParamsSchema,
-  organizationPath,
-  organizationSettingsPath,
-  rootPath,
-} from "~/utils/pathBuilder";
+import { extractDomain, faviconUrl as buildFaviconUrl } from "~/utils/favicon";
+import { OrganizationParamsSchema, organizationSettingsPath, rootPath } from "~/utils/pathBuilder";
+import { pageMeta } from "~/utils/pageTitle";
 
-export const meta: MetaFunction = () => {
-  return [
-    {
-      title: `Organization settings | Trigger.dev`,
-    },
-  ];
-};
+export const meta = pageMeta("Organization settings");
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const userId = await requireUserId(request);
@@ -79,6 +70,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       slug: true,
       title: true,
       avatar: true,
+      onboardingData: true,
     },
   });
 
@@ -86,8 +78,21 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     throw new Response("Not found", { status: 404 });
   }
 
+  const onboardingData = toRecord(organization.onboardingData);
+
+  const parsedAvatar = parseAvatar(organization.avatar, defaultAvatar);
+  const lastIconHex =
+    parsedAvatar.type === "image" && parsedAvatar.lastIconHex
+      ? parsedAvatar.lastIconHex
+      : defaultAvatarHex;
+
   return typedjson({
-    organization: { ...organization, avatar: parseAvatar(organization.avatar, defaultAvatar) },
+    organization: {
+      ...organization,
+      avatar: parsedAvatar,
+      companyUrl: typeof onboardingData.companyUrl === "string" ? onboardingData.companyUrl : "",
+      lastIconHex,
+    },
   });
 };
 
@@ -102,6 +107,7 @@ export function createSchema(
       type: AvatarType,
       name: z.string().optional(),
       hex: z.string().optional(),
+      url: z.string().optional(),
     }),
     z.object({
       action: z.literal("rename"),
@@ -116,7 +122,7 @@ export function createSchema(
         if (constraints.getSlugMatch === undefined) {
           ctx.addIssue({
             code: z.ZodIssueCode.custom,
-            message: conform.VALIDATION_UNDEFINED,
+            message: conformZodMessage.VALIDATION_UNDEFINED,
           });
         } else {
           const { isMatch, organizationSlug } = constraints.getSlugMatch(slug);
@@ -134,106 +140,166 @@ export function createSchema(
   ]);
 }
 
-export const action: ActionFunction = async ({ request, params }) => {
-  const user = await requireUser(request);
-  const { organizationSlug } = params;
-  if (!organizationSlug) {
-    return json({ errors: { body: "organizationSlug is required" } }, { status: 400 });
-  }
+const Params = z.object({
+  organizationSlug: z.string(),
+});
 
-  const formData = await request.formData();
-  const schema = createSchema({
-    getSlugMatch: (slug) => {
-      return { isMatch: slug === organizationSlug, organizationSlug };
+export const action = dashboardAction(
+  {
+    params: Params,
+    context: async (params) => {
+      const orgId = await resolveOrgIdFromSlug(params.organizationSlug);
+      return orgId ? { organizationId: orgId } : {};
     },
-  });
-  const submission = parse(formData, { schema });
+  },
+  async ({ ability, request, params }) => {
+    // clearCurrentProject (delete branch) needs the full UserFromSession
+    // (dashboardPreferences), which the builder's SessionUser doesn't carry.
+    const user = await requireUser(request);
+    const { organizationSlug } = params;
 
-  if (!submission.value || submission.intent !== "submit") {
-    return json(submission);
-  }
+    const formData = await request.formData();
+    const schema = createSchema({
+      getSlugMatch: (slug) => {
+        return { isMatch: slug === organizationSlug, organizationSlug };
+      },
+    });
+    const submission = parseWithZod(formData, { schema });
 
-  try {
-    switch (submission.value.action) {
-      case "rename": {
-        await prisma.organization.update({
-          where: {
-            slug: organizationSlug,
-            members: {
-              some: {
-                userId: user.id,
-              },
-            },
-          },
-          data: {
-            title: submission.value.organizationName,
-          },
-        });
-
-        return redirectWithSuccessMessage(
-          organizationSettingsPath({ slug: organizationSlug }),
-          request,
-          `Organization renamed to ${submission.value.organizationName}`
-        );
-      }
-      case "delete": {
-        const deleteOrganizationService = new DeleteOrganizationService();
-        try {
-          await deleteOrganizationService.call({ organizationSlug, userId: user.id, request });
-
-          //we need to clear the project from the session
-          await clearCurrentProject({
-            user,
-          });
-          return redirect(rootPath());
-        } catch (error: unknown) {
-          const errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
-          logger.error("Organization could not be deleted", {
-            error: errorMessage,
-          });
-          return redirectWithErrorMessage(
-            organizationSettingsPath({ slug: organizationSlug }),
-            request,
-            errorMessage
-          );
-        }
-      }
-      case "avatar": {
-        const avatar = AvatarData.safeParse(submission.value);
-
-        if (!avatar.success) {
-          return redirectWithErrorMessage(
-            organizationSettingsPath({ slug: organizationSlug }),
-            request,
-            avatar.error.message
-          );
-        }
-
-        await prisma.organization.update({
-          where: {
-            slug: organizationSlug,
-            members: {
-              some: {
-                userId: user.id,
-              },
-            },
-          },
-          data: {
-            avatar: avatar.data,
-          },
-        });
-
-        return redirectWithSuccessMessage(
-          organizationSettingsPath({ slug: organizationSlug }),
-          request,
-          `Updated icon`
-        );
-      }
+    if (submission.status !== "success") {
+      return json(submission.reply());
     }
-  } catch (error: any) {
-    return json({ errors: { body: error.message } }, { status: 400 });
+
+    try {
+      switch (submission.value.action) {
+        case "rename": {
+          if (!ability.can("manage", { type: "organization" })) {
+            throw await redirectWithErrorMessage(
+              organizationSettingsPath({ slug: organizationSlug }),
+              request,
+              "You don't have permission to rename this organization"
+            );
+          }
+          await prisma.organization.update({
+            where: {
+              slug: organizationSlug,
+              members: {
+                some: {
+                  userId: user.id,
+                },
+              },
+            },
+            data: {
+              title: submission.value.organizationName,
+            },
+          });
+
+          return redirectWithSuccessMessage(
+            organizationSettingsPath({ slug: organizationSlug }),
+            request,
+            `Organization renamed to ${submission.value.organizationName}`
+          );
+        }
+        case "delete": {
+          if (!ability.can("manage", { type: "organization" })) {
+            throw await redirectWithErrorMessage(
+              organizationSettingsPath({ slug: organizationSlug }),
+              request,
+              "You don't have permission to delete this organization"
+            );
+          }
+          const deleteOrganizationService = new DeleteOrganizationService();
+          try {
+            await deleteOrganizationService.call({ organizationSlug, userId: user.id, request });
+
+            //we need to clear the project from the session
+            await clearCurrentProject({
+              user,
+            });
+            return redirect(rootPath());
+          } catch (error: unknown) {
+            const errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
+            logger.error("Organization could not be deleted", {
+              error: errorMessage,
+            });
+            return redirectWithErrorMessage(
+              organizationSettingsPath({ slug: organizationSlug }),
+              request,
+              errorMessage
+            );
+          }
+        }
+        case "avatar": {
+          const orgWhere = {
+            slug: organizationSlug,
+            members: { some: { userId: user.id } },
+          };
+
+          if (submission.value.type === "image") {
+            const url = submission.value.url ?? "";
+            const domain = url ? extractDomain(url) : null;
+
+            const existing = await prisma.organization.findFirst({
+              where: orgWhere,
+              select: { avatar: true, onboardingData: true },
+            });
+
+            const existingData = toRecord(existing?.onboardingData);
+            const existingAvatar = parseAvatar(existing?.avatar ?? null, defaultAvatar);
+            const lastIconHex = extractLastIconHex(existingAvatar);
+
+            await prisma.organization.update({
+              where: orgWhere,
+              data: {
+                avatar: {
+                  type: "image",
+                  url: domain ? buildFaviconUrl(domain) : "",
+                  ...(lastIconHex ? { lastIconHex } : {}),
+                },
+                onboardingData: { ...existingData, companyUrl: url },
+              },
+            });
+
+            return redirectWithSuccessMessage(
+              organizationSettingsPath({ slug: organizationSlug }),
+              request,
+              `Updated logo`
+            );
+          }
+
+          const avatar = AvatarData.safeParse(submission.value);
+
+          if (!avatar.success) {
+            return redirectWithErrorMessage(
+              organizationSettingsPath({ slug: organizationSlug }),
+              request,
+              avatar.error.message
+            );
+          }
+
+          await prisma.organization.update({
+            where: orgWhere,
+            data: {
+              avatar: avatar.data,
+            },
+          });
+
+          return redirectWithSuccessMessage(
+            organizationSettingsPath({ slug: organizationSlug }),
+            request,
+            `Updated logo`
+          );
+        }
+      }
+    } catch (error: unknown) {
+      // Permission checks throw a redirect Response (toast) — let it through
+      // rather than flattening it into a generic 400.
+      if (error instanceof Response) throw error;
+      const message = error instanceof Error ? error.message : "An unexpected error occurred";
+      return json({ errors: { body: message } }, { status: 400 });
+    }
   }
-};
+);
 
 export default function Page() {
   const { organization } = useTypedLoaderData<typeof loader>();
@@ -243,10 +309,10 @@ export default function Page() {
   const [renameForm, { organizationName }] = useForm({
     id: "rename-organization",
     // TODO: type this
-    lastSubmission: lastSubmission as any,
+    lastResult: lastSubmission as any,
     shouldRevalidate: "onSubmit",
     onValidate({ formData }) {
-      return parse(formData, {
+      return parseWithZod(formData, {
         schema: createSchema(),
       });
     },
@@ -255,11 +321,11 @@ export default function Page() {
   const [deleteForm, { organizationSlug }] = useForm({
     id: "delete-organization",
     // TODO: type this
-    lastSubmission: lastSubmission as any,
+    lastResult: lastSubmission as any,
     shouldValidate: "onInput",
     shouldRevalidate: "onSubmit",
     onValidate({ formData }) {
-      return parse(formData, {
+      return parseWithZod(formData, {
         schema: createSchema({
           getSlugMatch: (slug) => ({
             isMatch: slug === organization.slug,
@@ -295,19 +361,19 @@ export default function Page() {
             </div>
 
             <div>
-              <Form method="post" {...renameForm.props}>
+              <Form method="post" {...getFormProps(renameForm)}>
                 <input type="hidden" name="action" value="rename" />
                 <Fieldset className="gap-y-0">
                   <InputGroup fullWidth>
                     <Label htmlFor={organizationName.id}>Organization name</Label>
                     <Input
-                      {...conform.input(organizationName, { type: "text" })}
+                      {...getInputProps(organizationName, { type: "text" })}
                       defaultValue={organization.title}
                       placeholder="Your organization name"
                       icon={FolderIcon}
                       autoFocus
                     />
-                    <FormError id={organizationName.errorId}>{organizationName.error}</FormError>
+                    <FormError id={organizationName.errorId}>{organizationName.errors}</FormError>
                   </InputGroup>
                   <FormButtons
                     confirmButton={
@@ -330,7 +396,7 @@ export default function Page() {
               <Header2 spacing>Danger zone</Header2>
               <Form
                 method="post"
-                {...deleteForm.props}
+                {...getFormProps(deleteForm)}
                 className="w-full rounded-sm border border-rose-500/40"
               >
                 <input type="hidden" name="action" value="delete" />
@@ -338,13 +404,13 @@ export default function Page() {
                   <InputGroup>
                     <Label htmlFor={organizationSlug.id}>Delete organization</Label>
                     <Input
-                      {...conform.input(organizationSlug, { type: "text" })}
+                      {...getInputProps(organizationSlug, { type: "text" })}
                       placeholder="Your organization slug"
                       icon={ExclamationTriangleIcon}
                       fullWidth
                     />
-                    <FormError id={organizationSlug.errorId}>{organizationSlug.error}</FormError>
-                    <FormError>{deleteForm.error}</FormError>
+                    <FormError id={organizationSlug.errorId}>{organizationSlug.errors}</FormError>
+                    <FormError>{deleteForm.errors}</FormError>
                     <Hint>
                       This change is irreversible, so please be certain. Type in the Organization
                       slug <InlineCode variant="extra-small">{organization.slug}</InlineCode> and
@@ -374,89 +440,163 @@ export default function Page() {
   );
 }
 
-function LogoForm({ organization }: { organization: { avatar: Avatar; title: string } }) {
+function LogoForm({
+  organization,
+}: {
+  organization: { avatar: AvatarT; title: string; companyUrl: string; lastIconHex: string };
+}) {
   const navigation = useNavigation();
 
-  const isSubmitting =
-    navigation.state != "idle" && navigation.formData?.get("action") === "avatar";
-
   const avatar = navigation.formData
-    ? avatarFromFormData(navigation.formData) ?? organization.avatar
+    ? (avatarFromFormData(navigation.formData) ?? organization.avatar)
     : organization.avatar;
 
-  const hex = "hex" in avatar ? avatar.hex : defaultAvatarHex;
+  const hex =
+    "hex" in avatar
+      ? avatar.hex
+      : avatar.type === "image" && avatar.lastIconHex
+        ? avatar.lastIconHex
+        : organization.lastIconHex;
+  const mode: "logo" | "icon" = avatar.type === "image" ? "logo" : "icon";
+
+  const [companyUrl, setCompanyUrl] = useState(organization.companyUrl);
+  const faviconPreview = useFaviconUrl(companyUrl);
+  const [faviconError, setFaviconError] = useState(false);
+  const logoFormRef = useRef<HTMLFormElement>(null);
+  const submit = useSubmit();
+  const prevFaviconRef = useRef(faviconPreview);
+
+  useEffect(() => {
+    if (faviconPreview === prevFaviconRef.current) return;
+    prevFaviconRef.current = faviconPreview;
+    if (mode === "logo" && logoFormRef.current) {
+      submit(logoFormRef.current);
+    }
+  }, [faviconPreview, mode, submit]);
+
+  const showFavicon = faviconPreview && !faviconError;
 
   return (
     <Fieldset>
       <InputGroup fullWidth>
-        <Label>Icon</Label>
-        <div className="flex w-full items-end justify-between gap-2">
-          <div className="grid place-items-center overflow-hidden rounded-sm border border-charcoal-750 bg-background-bright">
-            <Avatar avatar={avatar} size={5} includePadding orgName={organization.title} />
-          </div>
-          {/* Letters */}
-          <Form method="post">
+        <Label>Logo</Label>
+        <div className="flex flex-col gap-3">
+          {/* Row 1: Logo from URL */}
+          <Form ref={logoFormRef} method="post" className="flex items-center gap-3">
             <input type="hidden" name="action" value="avatar" />
-            <input type="hidden" name="type" value="letters" />
-            <input type="hidden" name="hex" value={hex} />
-            <button
-              type="submit"
-              className={cn(
-                "box-content grid size-10 place-items-center rounded-sm border-2 bg-charcoal-775",
-                avatar.type === "letters"
-                  ? undefined
-                  : "border-charcoal-775 hover:border-charcoal-600"
-              )}
-              style={{
-                borderColor: avatar.type === "letters" ? hex : undefined,
-              }}
-            >
-              <Avatar
-                avatar={{
-                  type: "letters",
-                  hex,
-                }}
-                size={2.5}
-                includePadding
-                orgName={organization.title}
-              />
+            <input type="hidden" name="type" value="image" />
+            <input type="hidden" name="url" value={companyUrl} />
+            <button type="submit" className="flex shrink-0 items-center gap-3">
+              <RadioDot active={mode === "logo"} />
             </button>
-          </Form>
-          {/* Icons */}
-          {Object.entries(avatarIcons).map(([name]) => (
-            <Form key={name} method="post">
-              <input type="hidden" name="action" value="avatar" />
-              <input type="hidden" name="type" value="icon" />
-              <input type="hidden" name="name" value={name} />
-              <input type="hidden" name="hex" value={hex} />
+            <div className="flex flex-1 items-center gap-1.5">
               <button
                 type="submit"
                 className={cn(
-                  "box-content grid size-10 place-items-center rounded-sm border-2 bg-charcoal-775",
-                  avatar.type === "icon" && avatar.name === name
-                    ? undefined
-                    : "border-charcoal-775 hover:border-charcoal-600"
+                  iconTileClass,
+                  mode === "logo"
+                    ? "border-indigo-500"
+                    : "border-grid-dimmed hover:border-border-bright"
                 )}
-                style={{
-                  borderColor: avatar.type === "icon" && avatar.name === name ? hex : undefined,
-                }}
               >
-                <Avatar
-                  key={name}
-                  avatar={{
-                    type: "icon",
-                    name,
-                    hex,
-                  }}
-                  size={2.5}
-                  includePadding
-                  orgName={organization.title}
-                />
+                {showFavicon ? (
+                  <img
+                    src={faviconPreview}
+                    alt=""
+                    width={28}
+                    height={28}
+                    className="rounded-sm"
+                    onError={() => setFaviconError(true)}
+                    onLoad={() => setFaviconError(false)}
+                  />
+                ) : (
+                  <GlobeLinesIcon className="size-6 text-indigo-500" />
+                )}
+              </button>
+              <Input
+                type="text"
+                value={companyUrl}
+                onChange={(e) => {
+                  setCompanyUrl(e.target.value);
+                  setFaviconError(false);
+                }}
+                onFocus={() => {
+                  if (mode !== "logo" && logoFormRef.current) {
+                    submit(logoFormRef.current);
+                  }
+                }}
+                placeholder="Enter your company URL to generate a logo"
+                variant="medium"
+                containerClassName="flex-1"
+              />
+            </div>
+          </Form>
+
+          {/* Row 2: Icon picker */}
+          <div className="flex items-center gap-3">
+            <Form method="post" className="shrink-0">
+              <input type="hidden" name="action" value="avatar" />
+              <input type="hidden" name="type" value="letters" />
+              <input type="hidden" name="hex" value={hex} />
+              <button type="submit">
+                <RadioDot active={mode === "icon"} />
               </button>
             </Form>
-          ))}
-          {/* Hex */}
-          <HexPopover avatar={avatar} hex={hex} />
+            <div className="flex flex-wrap items-center gap-1.5">
+              {/* Letters */}
+              <Form method="post">
+                <input type="hidden" name="action" value="avatar" />
+                <input type="hidden" name="type" value="letters" />
+                <input type="hidden" name="hex" value={hex} />
+                <button
+                  type="submit"
+                  className={cn(
+                    iconTileClass,
+                    avatar.type !== "letters" && "border-grid-dimmed hover:border-border-bright"
+                  )}
+                  style={{
+                    borderColor: avatar.type === "letters" ? hex : undefined,
+                  }}
+                >
+                  <Avatar
+                    avatar={{ type: "letters", hex }}
+                    size={2.5}
+                    includePadding
+                    orgName={organization.title}
+                  />
+                </button>
+              </Form>
+              {/* Icons */}
+              {Object.entries(avatarIcons).map(([name]) => (
+                <Form key={name} method="post">
+                  <input type="hidden" name="action" value="avatar" />
+                  <input type="hidden" name="type" value="icon" />
+                  <input type="hidden" name="name" value={name} />
+                  <input type="hidden" name="hex" value={hex} />
+                  <button
+                    type="submit"
+                    className={cn(
+                      iconTileClass,
+                      !(avatar.type === "icon" && avatar.name === name) &&
+                        "border-grid-dimmed hover:border-border-bright"
+                    )}
+                    style={{
+                      borderColor: avatar.type === "icon" && avatar.name === name ? hex : undefined,
+                    }}
+                  >
+                    <Avatar
+                      avatar={{ type: "icon", name, hex }}
+                      size={2.5}
+                      includePadding
+                      orgName={organization.title}
+                    />
+                  </button>
+                </Form>
+              ))}
+              {/* Color picker */}
+              <HexPopover avatar={avatar} hex={hex} />
+            </div>
+          </div>
         </div>
       </InputGroup>
     </Fieldset>
@@ -466,18 +606,25 @@ function LogoForm({ organization }: { organization: { avatar: Avatar; title: str
 function HexPopover({ avatar, hex }: { avatar: Avatar; hex: string }) {
   return (
     <Popover>
-      <PopoverTrigger className="box-content grid size-10 place-items-center rounded-sm border-2 border-charcoal-775 bg-charcoal-775 hover:border-charcoal-600">
-        <img src={colorWheelIcon} className="m-0 block size-[30px] p-0" />
+      <PopoverTrigger
+        aria-label="Choose custom avatar color"
+        className={cn(iconTileClass, "border-grid-dimmed hover:border-border-bright")}
+      >
+        <img src={colorWheelIcon} alt="" className="m-0 block size-[30px] p-0" />
       </PopoverTrigger>
       <PopoverContent
-        className="overflow-y-auto p-1 scrollbar-thin scrollbar-track-transparent scrollbar-thumb-charcoal-600"
+        className="overflow-y-auto p-1 scrollbar-thin scrollbar-track-transparent scrollbar-thumb-surface-control"
         align="start"
         style={{ maxHeight: `calc(var(--radix-popover-content-available-height) - 10vh)` }}
       >
-        <Form method="post" className="flex w-fit min-w-40 flex-col gap-1 ">
+        <Form method="post" className="flex w-fit min-w-40 flex-col gap-1">
           <input type="hidden" name="action" value="avatar" />
-          <input type="hidden" name="type" value={avatar.type} />
-          {"name" in avatar && <input type="hidden" name="name" value={avatar.name} />}
+          <input
+            type="hidden"
+            name="type"
+            value={avatar.type === "image" ? "letters" : avatar.type}
+          />
+          {avatar.type === "icon" && <input type="hidden" name="name" value={avatar.name} />}
           {defaultAvatarColors.map((color) => (
             <Button
               key={color.hex}
@@ -498,8 +645,10 @@ function HexPopover({ avatar, hex }: { avatar: Avatar; hex: string }) {
               fullWidth
               textAlignLeft
               className={cn(
-                "group-hover:bg-charcoal-700",
-                hex === color.hex ? "bg-charcoal-750 group-hover:bg-charcoal-600/50" : undefined
+                "group-hover:bg-background-raised",
+                hex === color.hex
+                  ? "bg-background-hover group-hover:bg-surface-control/50"
+                  : undefined
               )}
             >
               {color.name}
@@ -511,29 +660,53 @@ function HexPopover({ avatar, hex }: { avatar: Avatar; hex: string }) {
   );
 }
 
-function avatarFromFormData(formData: FormData): Avatar | undefined {
+function RadioDot({ active }: { active: boolean }) {
+  return (
+    <div
+      className={cn(
+        "flex shrink-0 items-center justify-center rounded-full border-2 p-0.5 transition",
+        active ? "border-indigo-500" : "border-grid-bright hover:border-border-bright"
+      )}
+    >
+      <div
+        className="size-2 rounded-full"
+        style={{ backgroundColor: active ? "#6366f1" : "transparent" }}
+      />
+    </div>
+  );
+}
+
+const iconTileClass =
+  "box-content grid size-10 shrink-0 place-items-center rounded-sm border-2 bg-background-bright";
+
+function toRecord(json: unknown): Record<string, unknown> {
+  return json && typeof json === "object" ? (json as Record<string, unknown>) : {};
+}
+
+function extractLastIconHex(avatar: AvatarT): string | undefined {
+  if ("hex" in avatar) return avatar.hex;
+  if (avatar.type === "image") return avatar.lastIconHex;
+  return undefined;
+}
+
+function avatarFromFormData(formData: FormData): AvatarT | undefined {
   const action = formData.get("action");
-  if (!action || action !== "avatar") {
-    return undefined;
-  }
+  if (action !== "avatar") return undefined;
 
   const type = formData.get("type");
-  const hex = formData.get("hex");
+  const hex = formData.get("hex") as string;
 
-  if (type === "letters") {
-    return {
-      type: "letters",
-      hex: hex as string,
-    };
+  switch (type) {
+    case "letters":
+      return { type: "letters", hex };
+    case "icon":
+      return { type: "icon", name: formData.get("name") as string, hex };
+    case "image": {
+      const url = formData.get("url") as string;
+      const domain = url ? extractDomain(url) : null;
+      return { type: "image", url: domain ? buildFaviconUrl(domain) : "" };
+    }
+    default:
+      return undefined;
   }
-
-  if (type === "icon") {
-    return {
-      type: "icon",
-      name: formData.get("name") as string,
-      hex: hex as string,
-    };
-  }
-
-  return undefined;
 }

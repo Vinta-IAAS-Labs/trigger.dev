@@ -1,8 +1,11 @@
-import { VirtualItem, Virtualizer, useVirtualizer } from "@tanstack/react-virtual";
+import type { VirtualItem, Virtualizer } from "@tanstack/react-virtual";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { motion } from "framer-motion";
-import { MutableRefObject, RefObject, useCallback, useEffect, useReducer, useRef } from "react";
+import type { MutableRefObject, RefObject } from "react";
+import { useEffect, useMemo, useReducer, useRef } from "react";
 import { cn } from "~/utils/cn";
-import { NodeState, NodesState, reducer } from "./reducer";
+import type { NodeState, NodesState } from "./reducer";
+import { reducer } from "./reducer";
 import { concreteStateFromInput, selectedIdFromState } from "./utils";
 
 export type TreeViewProps<TData> = {
@@ -23,9 +26,6 @@ export type TreeViewProps<TData> = {
   onScroll?: (scrollTop: number) => void;
 } & Pick<UseTreeStateOutput, "getTreeProps" | "getNodeProps">;
 
-export type GetTreePropsFn = UseTreeStateOutput["getTreeProps"];
-export type GetNodePropsFn = UseTreeStateOutput["getNodeProps"];
-
 export function TreeView<TData>({
   tree,
   renderNode,
@@ -43,25 +43,38 @@ export function TreeView<TData>({
     if (autoFocus) {
       parentRef?.current?.focus();
     }
-  }, [autoFocus, parentRef?.current]);
+  }, [autoFocus, parentRef]);
 
   const virtualItems = virtualizer.getVirtualItems();
 
-  const scrollCallback = useCallback(
-    (event: Event) => {
-      if (!onScroll) return;
-      const target = event.target as HTMLElement;
-      onScroll?.(target.scrollTop);
-    },
-    [onScroll]
-  );
+  // id -> node lookup so each virtual row resolves in O(1) instead of
+  // scanning the whole tree per row.
+  const nodesById = useMemo(() => {
+    const map = new Map<string, FlatTreeItem<TData>>();
+    for (const node of tree) {
+      map.set(node.id, node);
+    }
+    return map;
+  }, [tree]);
 
+  const onScrollRef = useRef(onScroll);
   useEffect(() => {
-    //subscribe to scrollRef scroll event
-    if (!scrollRef?.current || onScroll === undefined) return;
-    scrollRef.current.addEventListener("scroll", scrollCallback);
-    return () => scrollRef.current?.removeEventListener("scroll", scrollCallback);
-  }, [scrollRef?.current]);
+    onScrollRef.current = onScroll;
+  }, [onScroll]);
+
+  const hasOnScroll = onScroll !== undefined;
+  useEffect(() => {
+    const scrollElement = scrollRef?.current;
+    if (!scrollElement || !hasOnScroll) return;
+
+    const handleScroll = (event: Event) => {
+      const target = event.target as HTMLElement;
+      onScrollRef.current?.(target.scrollTop);
+    };
+
+    scrollElement.addEventListener("scroll", handleScroll);
+    return () => scrollElement.removeEventListener("scroll", handleScroll);
+  }, [hasOnScroll, scrollRef]);
 
   return (
     <motion.div
@@ -74,7 +87,7 @@ export function TreeView<TData>({
         }
       }}
       className={cn(
-        "w-full overflow-y-auto scrollbar-thin scrollbar-track-transparent scrollbar-thumb-charcoal-600 focus-within:outline-none",
+        "w-full overflow-y-auto scrollbar-thin scrollbar-track-transparent scrollbar-thumb-surface-control focus-within:outline-hidden",
         parentClassName
       )}
       layoutScroll
@@ -99,7 +112,7 @@ export function TreeView<TData>({
           }}
         >
           {virtualItems.map((virtualItem) => {
-            const node = tree.find((node) => node.id === virtualItem.key);
+            const node = nodesById.get(virtualItem.key as string);
             if (!node) return null;
             const state = nodes[node.id];
             if (!state) return null;
@@ -191,45 +204,79 @@ export function useTree<TData, TFilterValue>({
 }: TreeStateHookProps<TData, TFilterValue>): UseTreeStateOutput {
   const previousNodeCount = useRef(tree.length);
   const previousSelectedId = useRef<string | undefined>(selectedId);
+  const previousExternalSelectedId = useRef(selectedId);
+  const onSelectedIdChangedRef = useRef(onSelectedIdChanged);
+  const latestTreeRef = useRef(tree);
+  latestTreeRef.current = tree;
 
   const [state, dispatch] = useReducer(
     reducer,
     concreteStateFromInput({ tree, selectedId, collapsedIds, filter })
   );
+  const currentSelectedId = selectedIdFromState(state.nodes);
 
-  //fire onSelectedIdChanged()
+  // id -> index lookup so getNodeProps resolves in O(1) instead of scanning
+  // the whole tree per rendered row.
+  const treeIndexById = useMemo(() => {
+    const map = new Map<string, number>();
+    tree.forEach((node, index) => {
+      map.set(node.id, index);
+    });
+    return map;
+  }, [tree]);
+
+  // Sync external selectedId changes into internal state without turning the prop into
+  // a fully controlled value that immediately overrides internal keyboard selection.
   useEffect(() => {
-    const selectedId = selectedIdFromState(state.nodes);
-    if (selectedId !== previousSelectedId.current) {
-      previousSelectedId.current = selectedId;
-      onSelectedIdChanged?.(selectedId);
-    }
-  }, [state.changes.selectedId]);
+    if (selectedId === previousExternalSelectedId.current) return;
+    previousExternalSelectedId.current = selectedId;
 
-  //update tree when the number of nodes changes
+    if (selectedId === undefined) {
+      dispatch({ type: "DESELECT_ALL_NODES" });
+    } else {
+      dispatch({
+        type: "SELECT_NODE",
+        payload: { id: selectedId, scrollToNode: false, scrollToNodeFn: () => {} },
+      });
+    }
+  }, [selectedId]);
+
   useEffect(() => {
-    if (tree.length !== previousNodeCount.current) {
-      previousNodeCount.current = tree.length;
-      dispatch({ type: "UPDATE_TREE", payload: { tree } });
-    }
-  }, [previousNodeCount.current, tree.length]);
+    onSelectedIdChangedRef.current = onSelectedIdChanged;
+  }, [onSelectedIdChanged]);
 
-  //update the filter, if it's changed
-  const previousFilter = useRef(filter);
+  // Fire onSelectedIdChanged() only when selection changes, not when the callback is recreated.
   useEffect(() => {
-    //check if the value (not reference) of the filter is the same
-    const previousValue = previousFilter.current
-      ? JSON.stringify(previousFilter.current.value)
-      : undefined;
-    const newValue = filter ? JSON.stringify(filter.value) : undefined;
-
-    previousFilter.current = filter;
-
-    if (previousValue !== newValue) {
-      dispatch({ type: "UPDATE_FILTER", payload: { filter } });
+    if (currentSelectedId !== previousSelectedId.current) {
+      previousSelectedId.current = currentSelectedId;
+      onSelectedIdChangedRef.current?.(currentSelectedId);
     }
-  }, [filter?.value]);
+  }, [currentSelectedId]);
 
+  const treeNodeCount = tree.length;
+
+  // Callers may recreate the tree array; preserve reducer state unless its shape changes.
+  useEffect(() => {
+    if (treeNodeCount !== previousNodeCount.current) {
+      previousNodeCount.current = treeNodeCount;
+      dispatch({ type: "UPDATE_TREE", payload: { tree: latestTreeRef.current } });
+    }
+  }, [treeNodeCount]);
+
+  const latestFilterRef = useRef(filter);
+  latestFilterRef.current = filter;
+  const serializedFilterValue = filter ? JSON.stringify(filter.value) : undefined;
+  const previousSerializedFilterValue = useRef(serializedFilterValue);
+
+  // Filter behavior is keyed by value; callers may recreate the filter function every render.
+  useEffect(() => {
+    if (serializedFilterValue === previousSerializedFilterValue.current) return;
+
+    previousSerializedFilterValue.current = serializedFilterValue;
+    dispatch({ type: "UPDATE_FILTER", payload: { filter: latestFilterRef.current } });
+  }, [serializedFilterValue]);
+
+  // oxlint-disable-next-line react/incompatible-library -- TanStack Virtual is not compatible with compiler memoization.
   const virtualizer = useVirtualizer({
     count: state.visibleNodeIds.length,
     getItemKey: (index) => state.visibleNodeIds[index],
@@ -246,149 +293,98 @@ export function useTree<TData, TFilterValue>({
     overscan: 50,
   });
 
-  const scrollToNodeFn = useCallback(
-    (id: string) => {
-      const itemIndex = state.visibleNodeIds.findIndex((n) => n === id);
+  const scrollToNodeFn = (id: string) => {
+    const itemIndex = state.visibleNodeIds.findIndex((nodeId) => nodeId === id);
 
-      if (itemIndex !== -1) {
-        virtualizer.scrollToIndex(itemIndex, { align: "auto" });
-      }
-    },
-    [state]
-  );
+    if (itemIndex !== -1) {
+      virtualizer.scrollToIndex(itemIndex, { align: "auto" });
+    }
+  };
 
-  const selectNode = useCallback(
-    (id: string, scrollToNode = true) => {
-      dispatch({ type: "SELECT_NODE", payload: { id, scrollToNode, scrollToNodeFn } });
-    },
-    [state]
-  );
+  const selectNode = (id: string, scrollToNode = true) => {
+    dispatch({ type: "SELECT_NODE", payload: { id, scrollToNode, scrollToNodeFn } });
+  };
 
-  const deselectNode = useCallback(
-    (id: string) => {
-      dispatch({ type: "DESELECT_NODE", payload: { id } });
-    },
-    [state]
-  );
+  const deselectNode = (id: string) => {
+    dispatch({ type: "DESELECT_NODE", payload: { id } });
+  };
 
-  const deselectAllNodes = useCallback(() => {
+  const deselectAllNodes = () => {
     dispatch({ type: "DESELECT_ALL_NODES" });
-  }, [state]);
+  };
 
-  const toggleNodeSelection = useCallback(
-    (id: string, scrollToNode = true) => {
-      dispatch({ type: "TOGGLE_NODE_SELECTION", payload: { id, scrollToNode, scrollToNodeFn } });
-    },
-    [state]
-  );
+  const toggleNodeSelection = (id: string, scrollToNode = true) => {
+    dispatch({ type: "TOGGLE_NODE_SELECTION", payload: { id, scrollToNode, scrollToNodeFn } });
+  };
 
-  const expandNode = useCallback(
-    (id: string, scrollToNode = true) => {
-      dispatch({ type: "EXPAND_NODE", payload: { id, scrollToNode, scrollToNodeFn } });
-    },
-    [state]
-  );
+  const expandNode = (id: string, scrollToNode = true) => {
+    dispatch({ type: "EXPAND_NODE", payload: { id, scrollToNode, scrollToNodeFn } });
+  };
 
-  const collapseNode = useCallback(
-    (id: string) => {
-      dispatch({ type: "COLLAPSE_NODE", payload: { id } });
-    },
-    [state]
-  );
+  const collapseNode = (id: string) => {
+    dispatch({ type: "COLLAPSE_NODE", payload: { id } });
+  };
 
-  const toggleExpandNode = useCallback(
-    (id: string, scrollToNode = true) => {
-      dispatch({ type: "TOGGLE_EXPAND_NODE", payload: { id, scrollToNode, scrollToNodeFn } });
-    },
-    [state]
-  );
+  const toggleExpandNode = (id: string, scrollToNode = true) => {
+    dispatch({ type: "TOGGLE_EXPAND_NODE", payload: { id, scrollToNode, scrollToNodeFn } });
+  };
 
-  const selectFirstVisibleNode = useCallback(
-    (scrollToNode = true) => {
-      dispatch({
-        type: "SELECT_FIRST_VISIBLE_NODE",
-        payload: { scrollToNode, scrollToNodeFn },
-      });
-    },
-    [tree, state]
-  );
+  const selectFirstVisibleNode = (scrollToNode = true) => {
+    dispatch({
+      type: "SELECT_FIRST_VISIBLE_NODE",
+      payload: { scrollToNode, scrollToNodeFn },
+    });
+  };
 
-  const selectLastVisibleNode = useCallback(
-    (scrollToNode = true) => {
-      dispatch({
-        type: "SELECT_LAST_VISIBLE_NODE",
-        payload: { scrollToNode, scrollToNodeFn },
-      });
-    },
-    [tree, state]
-  );
+  const selectLastVisibleNode = (scrollToNode = true) => {
+    dispatch({
+      type: "SELECT_LAST_VISIBLE_NODE",
+      payload: { scrollToNode, scrollToNodeFn },
+    });
+  };
 
-  const selectNextVisibleNode = useCallback(
-    (scrollToNode = true) => {
-      dispatch({
-        type: "SELECT_NEXT_VISIBLE_NODE",
-        payload: { scrollToNode, scrollToNodeFn },
-      });
-    },
-    [state]
-  );
+  const selectNextVisibleNode = (scrollToNode = true) => {
+    dispatch({
+      type: "SELECT_NEXT_VISIBLE_NODE",
+      payload: { scrollToNode, scrollToNodeFn },
+    });
+  };
 
-  const selectPreviousVisibleNode = useCallback(
-    (scrollToNode = true) => {
-      dispatch({
-        type: "SELECT_PREVIOUS_VISIBLE_NODE",
-        payload: { scrollToNode, scrollToNodeFn },
-      });
-    },
-    [state]
-  );
+  const selectPreviousVisibleNode = (scrollToNode = true) => {
+    dispatch({
+      type: "SELECT_PREVIOUS_VISIBLE_NODE",
+      payload: { scrollToNode, scrollToNodeFn },
+    });
+  };
 
-  const selectParentNode = useCallback(
-    (scrollToNode = true) => {
-      dispatch({
-        type: "SELECT_PARENT_NODE",
-        payload: { scrollToNode, scrollToNodeFn },
-      });
-    },
-    [state]
-  );
+  const selectParentNode = (scrollToNode = true) => {
+    dispatch({
+      type: "SELECT_PARENT_NODE",
+      payload: { scrollToNode, scrollToNodeFn },
+    });
+  };
 
-  const expandAllBelowDepth = useCallback(
-    (depth: number) => {
-      dispatch({ type: "EXPAND_ALL_BELOW_DEPTH", payload: { depth } });
-    },
-    [state]
-  );
+  const expandAllBelowDepth = (depth: number) => {
+    dispatch({ type: "EXPAND_ALL_BELOW_DEPTH", payload: { depth } });
+  };
 
-  const collapseAllBelowDepth = useCallback(
-    (depth: number) => {
-      dispatch({ type: "COLLAPSE_ALL_BELOW_DEPTH", payload: { depth } });
-    },
-    [state]
-  );
+  const collapseAllBelowDepth = (depth: number) => {
+    dispatch({ type: "COLLAPSE_ALL_BELOW_DEPTH", payload: { depth } });
+  };
 
-  const expandLevel = useCallback(
-    (level: number) => {
-      dispatch({ type: "EXPAND_LEVEL", payload: { level } });
-    },
-    [state]
-  );
+  const expandLevel = (level: number) => {
+    dispatch({ type: "EXPAND_LEVEL", payload: { level } });
+  };
 
-  const collapseLevel = useCallback(
-    (level: number) => {
-      dispatch({ type: "COLLAPSE_LEVEL", payload: { level } });
-    },
-    [state]
-  );
+  const collapseLevel = (level: number) => {
+    dispatch({ type: "COLLAPSE_LEVEL", payload: { level } });
+  };
 
-  const toggleExpandLevel = useCallback(
-    (level: number) => {
-      dispatch({ type: "TOGGLE_EXPAND_LEVEL", payload: { level } });
-    },
-    [state]
-  );
+  const toggleExpandLevel = (level: number) => {
+    dispatch({ type: "TOGGLE_EXPAND_LEVEL", payload: { level } });
+  };
 
-  const getTreeProps = useCallback(() => {
+  const getTreeProps = () => {
     return {
       role: "tree",
       "aria-multiselectable": true,
@@ -479,26 +475,23 @@ export function useTree<TData, TFilterValue>({
         }
       },
     };
-  }, [state]);
+  };
 
-  const getNodeProps = useCallback(
-    (id: string) => {
-      const node = state.nodes[id];
-      if (!node) return {};
-      const treeItemIndex = tree.findIndex((node) => node.id === id);
-      const treeItem = tree[treeItemIndex];
-      return {
-        "aria-expanded": node.expanded,
-        "aria-level": treeItem.level + 1,
-        role: "treeitem",
-        tabIndex: node.selected ? -1 : undefined,
-      };
-    },
-    [state]
-  );
+  const getNodeProps = (id: string) => {
+    const node = state.nodes[id];
+    if (!node) return {};
+    const treeItemIndex = treeIndexById.get(id) ?? -1;
+    const treeItem = tree[treeItemIndex];
+    return {
+      "aria-expanded": node.expanded,
+      "aria-level": treeItem.level + 1,
+      role: "treeitem",
+      tabIndex: node.selected ? -1 : undefined,
+    };
+  };
 
   return {
-    selected: selectedIdFromState(state.nodes),
+    selected: currentSelectedId,
     nodes: state.nodes,
     getTreeProps,
     getNodeProps,
@@ -583,10 +576,13 @@ export function createTreeFromFlatItems<TData>(
   rootId: string
 ): Tree<TData> | undefined {
   // Index items by id
-  const indexedItems: { [id: string]: Tree<TData> } = withoutChildren.reduce((acc, item) => {
-    acc[item.id] = { id: item.id, runId: item.runId, data: item.data, children: [] };
-    return acc;
-  }, {} as { [id: string]: Tree<TData> });
+  const indexedItems: { [id: string]: Tree<TData> } = withoutChildren.reduce(
+    (acc, item) => {
+      acc[item.id] = { id: item.id, runId: item.runId, data: item.data, children: [] };
+      return acc;
+    },
+    {} as { [id: string]: Tree<TData> }
+  );
 
   // Add items to parent's children array
   withoutChildren.forEach((item) => {

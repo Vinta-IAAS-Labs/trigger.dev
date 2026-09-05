@@ -46,12 +46,6 @@ function getOldAuthConfigFilePath() {
 function getAuthConfigFilePath() {
   return path.join(getGlobalConfigFolderPath(), CONFIG_FILE);
 }
-
-function getAuthConfigFileBackupPath() {
-  // Multiple calls won't overwrite old backups
-  return path.join(getGlobalConfigFolderPath(), `${CONFIG_FILE}.bak-${Date.now()}`);
-}
-
 function getBlankConfig(): CliConfigFile {
   return {
     version: 2,
@@ -90,6 +84,11 @@ export function writeAuthConfigProfile(
   config.profiles[profile] = settings;
 
   writeAuthConfigFile(config);
+}
+
+export function listAuthConfigProfiles(): string[] {
+  const config = getConfig();
+  return Object.keys(config.profiles);
 }
 
 export function readAuthConfigProfile(
@@ -196,7 +195,7 @@ export function readAuthConfigFile(): CliConfigFile | null {
   }
 }
 
-export function writeAuthConfigFile(config: CliConfigFile) {
+function writeAuthConfigFile(config: CliConfigFile) {
   const authConfigFilePath = getAuthConfigFilePath();
   mkdirSync(path.dirname(authConfigFilePath), {
     recursive: true,

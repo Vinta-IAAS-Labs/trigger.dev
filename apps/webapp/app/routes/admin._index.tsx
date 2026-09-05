@@ -1,12 +1,10 @@
 import { MagnifyingGlassIcon } from "@heroicons/react/20/solid";
 import { Form } from "@remix-run/react";
-import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/server-runtime";
-import { redirect } from "@remix-run/server-runtime";
 import { typedjson, useTypedLoaderData } from "remix-typedjson";
 import { z } from "zod";
+import { env } from "~/env.server";
 import { Button, LinkButton } from "~/components/primitives/Buttons";
 import { CopyableText } from "~/components/primitives/CopyableText";
-import { Header1 } from "~/components/primitives/Headers";
 import { Input } from "~/components/primitives/Input";
 import { PaginationControls } from "~/components/primitives/Pagination";
 import { Paragraph } from "~/components/primitives/Paragraph";
@@ -19,10 +17,8 @@ import {
   TableHeaderCell,
   TableRow,
 } from "~/components/primitives/Table";
-import { useUser } from "~/hooks/useUser";
 import { adminGetUsers, redirectWithImpersonation } from "~/models/admin.server";
-import { commitImpersonationSession, setImpersonationId } from "~/services/impersonation.server";
-import { requireUserId } from "~/services/session.server";
+import { dashboardAction, dashboardLoader } from "~/services/routeBuilders/dashboardBuilder";
 import { createSearchParams } from "~/utils/searchParams";
 
 export const SearchParams = z.object({
@@ -32,34 +28,38 @@ export const SearchParams = z.object({
 
 export type SearchParams = z.infer<typeof SearchParams>;
 
-export const loader = async ({ request, params }: LoaderFunctionArgs) => {
-  const userId = await requireUserId(request);
+export const loader = dashboardLoader(
+  { authorization: { requireSuper: true } },
+  async ({ user, request }) => {
+    const searchParams = createSearchParams(request.url, SearchParams);
+    if (!searchParams.success) {
+      throw new Error(searchParams.error);
+    }
+    const result = await adminGetUsers(user.id, searchParams.params.getAll());
 
-  const searchParams = createSearchParams(request.url, SearchParams);
-  if (!searchParams.success) {
-    throw new Error(searchParams.error);
+    return typedjson({ ...result, impersonationEnabled: env.ADMIN_DASHBOARD_ENABLED });
   }
-  const result = await adminGetUsers(userId, searchParams.params.getAll());
-
-  return typedjson(result);
-};
+);
 
 const FormSchema = z.object({ id: z.string() });
 
-export async function action({ request }: ActionFunctionArgs) {
-  if (request.method.toLowerCase() !== "post") {
-    return new Response("Method not allowed", { status: 405 });
+export const action = dashboardAction(
+  { authorization: { requireSuper: true } },
+  async ({ request }) => {
+    if (request.method.toLowerCase() !== "post") {
+      return new Response("Method not allowed", { status: 405 });
+    }
+
+    const payload = Object.fromEntries(await request.formData());
+    const { id } = FormSchema.parse(payload);
+
+    return redirectWithImpersonation(request, id, "/");
   }
-
-  const payload = Object.fromEntries(await request.formData());
-  const { id } = FormSchema.parse(payload);
-
-  return redirectWithImpersonation(request, id, "/");
-}
+);
 
 export default function AdminDashboardRoute() {
-  const user = useUser();
-  const { users, filters, page, pageCount } = useTypedLoaderData<typeof loader>();
+  const { users, filters, page, pageCount, impersonationEnabled } =
+    useTypedLoaderData<typeof loader>();
 
   return (
     <main
@@ -136,23 +136,25 @@ export default function AdminDashboardRoute() {
                     </TableCell>
                     <TableCell>{user.admin ? "✅" : ""}</TableCell>
                     <TableCell isSticky={true}>
-                      <Form method="post" reloadDocument>
-                        <input type="hidden" name="id" value={user.id} />
-                        <Button
-                          type="submit"
-                          name="action"
-                          value="impersonate"
-                          className="mr-2"
-                          variant="tertiary/small"
-                          shortcut={
-                            users.length === 1
-                              ? { modifiers: ["mod"], key: "enter", enabledOnInputElements: true }
-                              : undefined
-                          }
-                        >
-                          Impersonate
-                        </Button>
-                      </Form>
+                      {impersonationEnabled && (
+                        <Form method="post" action="/admin/impersonate" reloadDocument>
+                          <input type="hidden" name="id" value={user.id} />
+                          <Button
+                            type="submit"
+                            name="action"
+                            value="impersonate"
+                            className="mr-2"
+                            variant="tertiary/small"
+                            shortcut={
+                              users.length === 1
+                                ? { modifiers: ["mod"], key: "enter", enabledOnInputElements: true }
+                                : undefined
+                            }
+                          >
+                            Impersonate
+                          </Button>
+                        </Form>
+                      )}
                     </TableCell>
                   </TableRow>
                 );

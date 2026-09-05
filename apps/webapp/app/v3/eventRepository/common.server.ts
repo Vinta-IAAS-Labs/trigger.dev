@@ -1,7 +1,11 @@
-import { Attributes } from "@opentelemetry/api";
+import type { Attributes } from "@opentelemetry/api";
 import { RandomIdGenerator } from "@opentelemetry/sdk-trace-base";
 import { parseTraceparent } from "@trigger.dev/core/v3/isomorphic";
-import { ExceptionEventProperties, SpanEvents, TaskRunError } from "@trigger.dev/core/v3/schemas";
+import type {
+  ExceptionEventProperties,
+  SpanEvents,
+  TaskRunError,
+} from "@trigger.dev/core/v3/schemas";
 import { unflattenAttributes } from "@trigger.dev/core/v3/utils/flattenAttributes";
 import { createHash } from "node:crypto";
 
@@ -140,7 +144,8 @@ export function createExceptionPropertiesFromError(error: TaskRunError): Excepti
   }
 }
 
-// removes keys that start with a $ sign. If there are no keys left, return undefined
+// Removes internal/private attribute keys from span properties.
+// Filters: "$" prefixed keys (private metadata) and "ctx." prefixed keys (Trigger.dev run context)
 export function removePrivateProperties(
   attributes: Attributes | undefined | null
 ): Attributes | undefined {
@@ -151,7 +156,7 @@ export function removePrivateProperties(
   const result: Attributes = {};
 
   for (const [key, value] of Object.entries(attributes)) {
-    if (key.startsWith("$")) {
+    if (key.startsWith("$") || key.startsWith("ctx.")) {
       continue;
     }
 
@@ -167,7 +172,7 @@ export function removePrivateProperties(
 
 export function isEmptyObject(obj: object) {
   for (var prop in obj) {
-    if (Object.prototype.hasOwnProperty.call(obj, prop)) {
+    if (Object.hasOwn(obj, prop)) {
       return false;
     }
   }

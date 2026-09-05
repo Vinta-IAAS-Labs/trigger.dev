@@ -1,6 +1,18 @@
 import { ResolvedConfig } from "@trigger.dev/core/v3/build";
 import { BuildManifest, BuildTarget } from "@trigger.dev/core/v3/schemas";
-import { BundleResult, bundleWorker, createBuildManifestFromBundle } from "./bundle.js";
+import {
+  BundleResult,
+  bundleWorker,
+  createBuildManifestFromBundle,
+  logBuildWarnings,
+} from "./bundle.js";
+import {
+  collectCreateRequireWarningMessages,
+  CreateRequireCollector,
+  extensionInstalledPackageMatchers,
+  NODE_MODULES_SEGMENT_REGEX,
+} from "./createRequireWarnings.js";
+import { bundleSkills } from "./bundleSkills.js";
 import {
   createBuildContext,
   notifyExtensionOnBuildComplete,
@@ -8,19 +20,22 @@ import {
   resolvePluginsForContext,
 } from "./extensions.js";
 import { createExternalsBuildExtension } from "./externals.js";
+import { tmpdir } from "node:os";
+import { mkdtemp, rm } from "node:fs/promises";
 import { join, relative, sep } from "node:path";
 import { generateContainerfile } from "../deploy/buildImage.js";
 import { writeFile } from "node:fs/promises";
 import { buildManifestToJSON } from "../utilities/buildManifest.js";
+import { logger } from "../utilities/logger.js";
 import { readPackageJSON } from "pkg-types";
 import { writeJSONFile } from "../utilities/fileSystem.js";
 import { isWindows } from "std-env";
 import { pathToFileURL } from "node:url";
-import { logger } from "../utilities/logger.js";
+import { logBuildWorkerStart } from "./buildWorkerLogging.js";
 import { SdkVersionExtractor } from "./plugins.js";
 import { spinner } from "../utilities/windows.js";
 
-export type BuildWorkerEventListener = {
+type BuildWorkerEventListener = {
   onBundleStart?: () => void;
   onBundleComplete?: (result: BundleResult) => void;
 };
@@ -39,11 +54,11 @@ export type BuildWorkerOptions = {
 };
 
 export async function buildWorker(options: BuildWorkerOptions) {
-  logger.debug("Starting buildWorker", {
-    options,
-  });
+  logBuildWorkerStart(options);
 
   const resolvedConfig = options.resolvedConfig;
+
+  const extensionPackages = extensionInstalledPackageMatchers(resolvedConfig);
 
   const externalsExtension = createExternalsBuildExtension(
     options.target,
@@ -70,6 +85,7 @@ export async function buildWorker(options: BuildWorkerOptions) {
   const pluginsFromExtensions = resolvePluginsForContext(buildContext);
 
   const sdkVersionExtractor = new SdkVersionExtractor();
+  const createRequireCollector = new CreateRequireCollector(resolvedConfig.workingDir);
 
   options.listener?.onBundleStart?.();
 
@@ -79,7 +95,11 @@ export async function buildWorker(options: BuildWorkerOptions) {
     destination: options.destination,
     watch: false,
     resolvedConfig,
-    plugins: [sdkVersionExtractor.plugin, ...pluginsFromExtensions],
+    plugins: [
+      sdkVersionExtractor.plugin,
+      ...(options.target === "dev" ? [] : [createRequireCollector.plugin]),
+      ...pluginsFromExtensions,
+    ],
     jsxFactory: resolvedConfig.build.jsx.factory,
     jsxFragment: resolvedConfig.build.jsx.fragment,
     jsxAutomatic: resolvedConfig.build.jsx.automatic,
@@ -97,9 +117,51 @@ export async function buildWorker(options: BuildWorkerOptions) {
     envVars: options.envVars,
   });
 
+  // Built-in skill bundler — discovers `ai.defineSkill` registrations
+  // via a local indexer run and copies each skill folder into
+  // `{destination}/.trigger/skills/{id}/` before Docker COPY picks up
+  // the bundle. First-class, not a build extension.
+  const skillsTmpDir = await mkdtemp(join(tmpdir(), "trigger-skills-"));
+  const skillsBuildManifestPath = join(skillsTmpDir, "build.json");
+  try {
+    await writeFile(skillsBuildManifestPath, JSON.stringify(buildManifest));
+    const skillsResult = await bundleSkills({
+      buildManifest,
+      buildManifestPath: skillsBuildManifestPath,
+      workingDir: resolvedConfig.workingDir,
+      env: {
+        ...process.env,
+        ...(options.envVars ?? {}),
+      },
+      logger: buildContext.logger,
+    });
+    buildManifest = skillsResult.buildManifest;
+  } catch (err) {
+    logger.warn("Skill bundling failed; continuing without skills", err);
+  } finally {
+    await rm(skillsTmpDir, { recursive: true, force: true }).catch(() => {});
+  }
+
   buildManifest = await notifyExtensionOnBuildComplete(buildContext, buildManifest);
 
   if (options.target !== "dev") {
+    const buildWarnings = [
+      ...bundleResult.warnings.filter(
+        (warning) =>
+          !warning.location?.file || !NODE_MODULES_SEGMENT_REGEX.test(warning.location.file)
+      ),
+      ...collectCreateRequireWarningMessages({
+        usages: createRequireCollector.usages,
+        buildManifest,
+        extensionPackages,
+        target: options.target,
+      }),
+    ];
+
+    if (buildWarnings.length > 0) {
+      logBuildWarnings(buildWarnings, { color: !options.plain });
+    }
+
     buildManifest = options.rewritePaths
       ? rewriteBuildManifestPaths(buildManifest, options.destination)
       : buildManifest;
@@ -115,6 +177,7 @@ export async function buildWorker(options: BuildWorkerOptions) {
   return buildManifest;
 }
 
+/** @knipignore Exported for the CLI end-to-end suite. */
 export function rewriteBuildManifestPaths(
   buildManifest: BuildManifest,
   destinationDir: string

@@ -1,43 +1,59 @@
-import {
-  ArrowUpRightIcon,
-  BookOpenIcon,
-  CalendarDaysIcon,
-  EnvelopeIcon,
-  LightBulbIcon,
-  QuestionMarkCircleIcon,
-  SignalIcon,
-  StarIcon,
-} from "@heroicons/react/20/solid";
-import { cn } from "~/utils/cn";
-import { DiscordIcon, SlackIcon } from "@trigger.dev/companyicons";
-import { Fragment, useState } from "react";
+import { ArrowUpRightIcon } from "@heroicons/react/20/solid";
 import { motion } from "framer-motion";
-import { useCurrentPlan } from "~/routes/_app.orgs.$organizationSlug/route";
+import { useState } from "react";
+import { BookIcon } from "~/assets/icons/BookIcon";
+import { BulbIcon } from "~/assets/icons/BulbIcon";
+import { DropdownIcon } from "~/assets/icons/DropdownIcon";
+import { EnvelopeIcon } from "~/assets/icons/EnvelopeIcon";
+import { QuestionMarkIcon } from "~/assets/icons/QuestionMarkIcon";
+import { RadarPulseIcon } from "~/assets/icons/RadarPulseIcon";
+import { StarIcon } from "~/assets/icons/StarIcon";
+import { AISparkleIcon } from "~/assets/icons/AISparkleIcon";
+import { ASK_AGENT_LABEL } from "~/components/dashboard-agent/agent-identity";
+import { aiMenuEntries } from "~/components/dashboard-agent/ai-entry-points";
+import { ASK_AI_SHORTCUT, askAiCanOpen } from "~/components/dashboard-agent/ask-ai-channels";
+import { requestAskAi } from "~/components/dashboard-agent/askAiOpenRequest";
+import { AgentMonoLogo } from "~/components/primitives/AgentDotMatrix";
+import { TOGGLE_PANEL_SHORTCUT } from "~/components/dashboard-agent/dashboardAgentLauncher";
+import {
+  requestDashboardAgent,
+  useDashboardAgentAvailable,
+} from "~/components/dashboard-agent/dashboardAgentOpenRequest";
+import { useAskAiAvailability } from "~/hooks/useAskAiAvailability";
 import { useShortcutKeys } from "~/hooks/useShortcutKeys";
+import { useCurrentPlan } from "~/routes/_app.orgs.$organizationSlug/route";
+import { useRecentChangelogs } from "~/routes/resources.platform-changelogs";
+import { cn } from "~/utils/cn";
+import { sanitizeHttpUrl } from "~/utils/sanitizeUrl";
 import { Feedback } from "../Feedback";
 import { Shortcuts } from "../Shortcuts";
-import { StepContentContainer } from "../StepContentContainer";
-import { Button } from "../primitives/Buttons";
-import { ClipboardField } from "../primitives/ClipboardField";
-import { Dialog, DialogContent, DialogHeader, DialogTrigger } from "../primitives/Dialog";
-import { Icon } from "../primitives/Icon";
 import { Paragraph } from "../primitives/Paragraph";
 import { Popover, PopoverContent, PopoverTrigger } from "../primitives/Popover";
-import { SimpleTooltip } from "../primitives/Tooltip";
 import { ShortcutKey } from "../primitives/ShortcutKey";
-import { StepNumber } from "../primitives/StepNumber";
-import { SideMenuItem } from "./SideMenuItem";
-import { Badge } from "../primitives/Badge";
+import { SimpleTooltip } from "../primitives/Tooltip";
+import { SideMenuItem, SideMenuItemButton } from "./SideMenuItem";
 
 export function HelpAndFeedback({
   disableShortcut = false,
   isCollapsed = false,
+  organizationId,
+  projectId,
 }: {
   disableShortcut?: boolean;
   isCollapsed?: boolean;
+  organizationId?: string;
+  projectId?: string;
 }) {
   const [isHelpMenuOpen, setHelpMenuOpen] = useState(false);
-  const currentPlan = useCurrentPlan();
+  // Hosted outside the popover (below) and opened from the menu item, so the popover closing never
+  // unmounts the feedback form mid-submit — that teardown was intermittently canceling the POST to
+  // /resources/feedback, so messages sent from the sidebar were silently lost.
+  const [isFeedbackOpen, setFeedbackOpen] = useState(false);
+  const _currentPlan = useCurrentPlan();
+  const agentAvailable = useDashboardAgentAvailable();
+  const askAiAvailable = askAiCanOpen(useAskAiAvailability());
+  const aiEntries = aiMenuEntries({ agent: agentAvailable, askAi: askAiAvailable });
+  const { changelogs } = useRecentChangelogs(organizationId, projectId);
 
   useShortcutKeys({
     shortcut: disableShortcut ? undefined : { key: "h", enabledOnInputElements: false },
@@ -52,203 +68,183 @@ export function HelpAndFeedback({
     <motion.div
       layout="position"
       transition={{ duration: 0.2, ease: "easeInOut" }}
-      className={isCollapsed ? undefined : "flex-1"}
+      className={isCollapsed ? undefined : "min-w-0 flex-1"}
     >
       <Popover open={isHelpMenuOpen} onOpenChange={setHelpMenuOpen}>
-      <SimpleTooltip
-        button={
-          <PopoverTrigger
-            className={cn(
-              "group flex h-8 items-center gap-1.5 rounded pl-[0.4375rem] pr-2 transition-colors hover:bg-charcoal-750 focus-custom",
-              isCollapsed ? "w-full" : "w-full justify-between"
-            )}
-          >
-            <span className="flex items-center gap-1.5 overflow-hidden">
-              <QuestionMarkCircleIcon className="size-5 min-w-5 shrink-0 text-success" />
-              <span
-                className={cn(
-                  "overflow-hidden whitespace-nowrap text-2sm text-text-bright transition-all duration-150",
-                  isCollapsed ? "max-w-0 opacity-0" : "max-w-[150px] opacity-100"
-                )}
-              >
-                Help & Feedback
-              </span>
-            </span>
-            <ShortcutKey
+        <SimpleTooltip
+          button={
+            <PopoverTrigger
               className={cn(
-                "size-4 flex-none transition-all duration-150",
-                isCollapsed ? "hidden" : ""
+                "group flex h-8 items-center gap-1.5 rounded pl-1.75 pr-2 hover:bg-background-hover focus-custom",
+                isCollapsed ? "w-full" : "w-full justify-between"
               )}
-              shortcut={{ key: "h" }}
-              variant="medium/bright"
-            />
-          </PopoverTrigger>
-        }
-        content={
-          <span className="flex items-center gap-1">
-            Help & Feedback
-            <ShortcutKey shortcut={{ key: "h" }} variant="medium/bright" />
-          </span>
-        }
-        side="right"
-        sideOffset={8}
-        hidden={!isCollapsed}
-        buttonClassName="!h-8 w-full"
-        asChild
-        disableHoverableContent
-      />
-      <PopoverContent
-        className="min-w-[14rem] divide-y divide-grid-bright overflow-y-auto p-0 scrollbar-thin scrollbar-track-transparent scrollbar-thumb-charcoal-600"
-        side={isCollapsed ? "right" : "top"}
-        sideOffset={isCollapsed ? 8 : 4}
-        align="start"
-      >
-        <Fragment>
-          <div className="flex flex-col gap-1 p-1">
-            <SideMenuItem
-              name="Documentation"
-              icon={BookOpenIcon}
-              trailingIcon={ArrowUpRightIcon}
-              trailingIconClassName="text-text-dimmed"
-              inactiveIconColor="text-green-500"
-              activeIconColor="text-green-500"
-              to="https://trigger.dev/docs"
-              data-action="documentation"
-              target="_blank"
-            />
-          </div>
-          <div className="flex flex-col gap-1 p-1">
-            <SideMenuItem
-              name="Status"
-              icon={SignalIcon}
-              trailingIcon={ArrowUpRightIcon}
-              trailingIconClassName="text-text-dimmed"
-              inactiveIconColor="text-green-500"
-              activeIconColor="text-green-500"
-              to="https://status.trigger.dev/"
-              data-action="status"
-              target="_blank"
-            />
-            <SideMenuItem
-              name="Suggest a feature"
-              icon={LightBulbIcon}
-              trailingIcon={ArrowUpRightIcon}
-              trailingIconClassName="text-text-dimmed"
-              inactiveIconColor="text-sun-500"
-              activeIconColor="text-sun-500"
-              to="https://feedback.trigger.dev/"
-              data-action="suggest-a-feature"
-              target="_blank"
-            />
-            <SideMenuItem
-              name="Changelog"
-              icon={StarIcon}
-              trailingIcon={ArrowUpRightIcon}
-              trailingIconClassName="text-text-dimmed"
-              inactiveIconColor="text-sun-500"
-              activeIconColor="text-sun-500"
-              to="https://trigger.dev/changelog"
-              data-action="changelog"
-              target="_blank"
-            />
-            <Shortcuts />
-          </div>
-          <div className="flex flex-col gap-1 p-1">
-            <Paragraph className="pb-1 pl-1.5 pt-1.5 text-xs">Need help?</Paragraph>
-            {currentPlan?.v3Subscription?.plan?.limits.support === "slack" && (
-              <div>
-                <Dialog>
-                  <DialogTrigger asChild>
-                    <Button
-                      variant="small-menu-item"
-                      LeadingIcon={SlackIcon}
-                      data-action="join-our-slack"
-                      fullWidth
-                      textAlignLeft
-                    >
-                      <div className="flex w-full items-center justify-between">
-                        <span className="text-text-bright">Join our Slack…</span>
-                        <Badge variant="extra-small" className="uppercase">
-                          Pro
-                        </Badge>
-                      </div>
-                    </Button>
-                  </DialogTrigger>
-                  <DialogContent>
-                    <DialogHeader>Join our Slack</DialogHeader>
-                    <div className="mt-2 flex flex-col gap-4">
-                      <div className="flex items-center gap-4">
-                        <Icon icon={SlackIcon} className="h-10 w-10 min-w-[2.5rem]" />
-                        <Paragraph variant="base/bright">
-                          As a subscriber, you have access to a dedicated Slack channel for 1-to-1
-                          support with the Trigger.dev team.
-                        </Paragraph>
-                      </div>
-                      <hr className="border-charcoal-800" />
-                      <div>
-                        <StepNumber stepNumber="1" title="Email us" />
-                        <StepContentContainer>
-                          <Paragraph>
-                            Send us an email to this address from your Trigger.dev account email
-                            address:
-                            <ClipboardField
-                              variant="secondary/medium"
-                              value="priority-support@trigger.dev"
-                              className="my-2"
-                            />
-                          </Paragraph>
-                        </StepContentContainer>
-                        <StepNumber stepNumber="2" title="Look out for an invite from Slack" />
-                        <StepContentContainer>
-                          <Paragraph>
-                            As soon as we can, we'll setup a Slack Connect channel and say hello!
-                          </Paragraph>
-                        </StepContentContainer>
-                      </div>
-                    </div>
-                  </DialogContent>
-                </Dialog>
+            >
+              <span className="flex min-w-0 items-center gap-1.5 overflow-hidden">
+                <QuestionMarkIcon className="size-5 min-w-5 shrink-0 text-success" />
+                {/*
+                      Width + opacity follow --sm-label-opacity so the label tracks a drag both
+                      directions (no CSS transition — it would lag the per-frame writes).
+                    */}
+                <span
+                  className="min-w-0 overflow-hidden whitespace-nowrap text-[0.90625rem] font-medium tracking-[-0.01em] text-text-dimmed group-hover:text-text-bright"
+                  style={{
+                    maxWidth: "calc(var(--sm-label-opacity, 1) * 150px)",
+                    opacity: "var(--sm-label-opacity, 1)",
+                  }}
+                >
+                  Help & Feedback
+                </span>
+              </span>
+              {/*
+                    Hover chevron, only when expanded. Its 16px width follows --sm-label-opacity so
+                    an invisible chevron never holds width mid-drag and clips the help icon.
+                  */}
+              {!isCollapsed && (
+                <span
+                  className="overflow-hidden opacity-0 group-hover:opacity-100"
+                  style={{ maxWidth: "calc(var(--sm-label-opacity, 1) * 16px)" }}
+                >
+                  <DropdownIcon className="size-4 min-w-4 text-text-dimmed group-hover:text-text-bright" />
+                </span>
+              )}
+            </PopoverTrigger>
+          }
+          content={
+            <span className="flex items-center gap-1">
+              Help & Feedback
+              <ShortcutKey shortcut={{ key: "h" }} variant="medium/bright" />
+            </span>
+          }
+          side="right"
+          sideOffset={8}
+          delayDuration={isCollapsed ? 0 : 500}
+          buttonClassName="h-8! w-full"
+          asChild
+          tabbable
+          disableHoverableContent
+        />
+        <PopoverContent
+          className="min-w-56 divide-y divide-grid-bright overflow-y-auto p-0 scrollbar-thin scrollbar-track-transparent scrollbar-thumb-surface-control"
+          side={isCollapsed ? "right" : "top"}
+          sideOffset={isCollapsed ? 8 : 4}
+          align="start"
+        >
+          <>
+            {/* This popover lives in the app layout, above both AI hosts, so it opens them
+                through their open-request bridges rather than context. The hosts register the
+                keystrokes; this only shows them. */}
+            {aiEntries.length > 0 && (
+              <div className="flex flex-col gap-1 p-1">
+                {aiEntries.map((entry) =>
+                  entry === "agent" ? (
+                    <SideMenuItemButton
+                      key={entry}
+                      icon={<AgentMonoLogo size={18} decorative />}
+                      name={ASK_AGENT_LABEL}
+                      data-action="ask-agent"
+                      trailing={<ShortcutKey shortcut={TOGGLE_PANEL_SHORTCUT} variant="medium" />}
+                      onClick={() => {
+                        setHelpMenuOpen(false);
+                        requestDashboardAgent();
+                      }}
+                    />
+                  ) : (
+                    <SideMenuItemButton
+                      key={entry}
+                      icon={AISparkleIcon}
+                      name="Ask AI"
+                      data-action="ask-ai"
+                      trailing={<ShortcutKey shortcut={ASK_AI_SHORTCUT} variant="medium" />}
+                      onClick={() => {
+                        setHelpMenuOpen(false);
+                        requestAskAi();
+                      }}
+                    />
+                  )
+                )}
               </div>
             )}
-            <SideMenuItem
-              name="Ask in our Discord"
-              icon={DiscordIcon}
-              trailingIcon={ArrowUpRightIcon}
-              trailingIconClassName="text-text-dimmed"
-              to="https://trigger.dev/discord"
-              data-action="join our discord"
-              target="_blank"
-            />
-            <SideMenuItem
-              name="Book a 15 min call"
-              icon={CalendarDaysIcon}
-              trailingIcon={ArrowUpRightIcon}
-              trailingIconClassName="text-text-dimmed"
-              inactiveIconColor="text-rose-500"
-              activeIconColor="text-rose-500"
-              to="https://cal.com/team/triggerdotdev/founders-call"
-              data-action="book-a-call"
-              target="_blank"
-            />
-            <Feedback
-              button={
-                <Button
-                  variant="small-menu-item"
-                  className="pl-2"
-                  LeadingIcon={EnvelopeIcon}
-                  leadingIconClassName="text-blue-500 pr-1"
-                  data-action="contact-us"
-                  fullWidth
-                  textAlignLeft
-                >
-                  Contact us…
-                </Button>
-              }
-            />
-          </div>
-        </Fragment>
-      </PopoverContent>
+            <div className="flex flex-col gap-1 p-1">
+              <SideMenuItem
+                name="Documentation"
+                icon={BookIcon}
+                trailingIcon={ArrowUpRightIcon}
+                trailingIconClassName="text-text-dimmed"
+                to="https://trigger.dev/docs"
+                data-action="documentation"
+                target="_blank"
+              />
+            </div>
+            <div className="flex flex-col gap-1 p-1">
+              <SideMenuItem
+                name="Status"
+                icon={RadarPulseIcon}
+                trailingIcon={ArrowUpRightIcon}
+                trailingIconClassName="text-text-dimmed"
+                to="https://status.trigger.dev/"
+                data-action="status"
+                target="_blank"
+              />
+              <SideMenuItem
+                name="Suggest a feature"
+                icon={BulbIcon}
+                trailingIcon={ArrowUpRightIcon}
+                trailingIconClassName="text-text-dimmed"
+                to="https://feedback.trigger.dev/"
+                data-action="suggest-a-feature"
+                target="_blank"
+              />
+              <Shortcuts />
+              <SideMenuItemButton
+                icon={EnvelopeIcon}
+                name="Contact us…"
+                data-action="contact-us"
+                onClick={() => {
+                  setHelpMenuOpen(false);
+                  setFeedbackOpen(true);
+                }}
+              />
+            </div>
+            <div className="flex flex-col gap-1 p-1">
+              <Paragraph className="pb-1 pl-1.5 pt-1.5 text-xs">What's new</Paragraph>
+              {changelogs.map((entry) => (
+                <SideMenuItem
+                  key={entry.id}
+                  name={entry.title}
+                  icon={GrayDotIcon}
+                  trailingIcon={ArrowUpRightIcon}
+                  trailingIconClassName="text-text-dimmed"
+                  inactiveIconColor="text-text-dimmed"
+                  activeIconColor="text-text-dimmed"
+                  to={sanitizeHttpUrl(entry.actionUrl) ?? "https://trigger.dev/changelog"}
+                  target="_blank"
+                />
+              ))}
+              <SideMenuItem
+                name="Full changelog"
+                icon={StarIcon}
+                trailingIcon={ArrowUpRightIcon}
+                trailingIconClassName="text-text-dimmed"
+                inactiveIconColor="text-text-dimmed"
+                activeIconColor="text-text-dimmed"
+                to="https://trigger.dev/changelog"
+                data-action="full-changelog"
+                target="_blank"
+              />
+            </div>
+          </>
+        </PopoverContent>
       </Popover>
+      {/* Hosted outside the popover so closing the menu can't unmount the form mid-submit. */}
+      <Feedback open={isFeedbackOpen} setOpen={setFeedbackOpen} />
     </motion.div>
+  );
+}
+
+function GrayDotIcon({ className }: { className?: string }) {
+  return (
+    <span className={cn("flex items-center justify-center", className)}>
+      <span className="block h-1.5 w-1.5 rounded-full bg-text-dimmed" />
+    </span>
   );
 }

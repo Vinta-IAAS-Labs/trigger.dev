@@ -5,23 +5,12 @@ import {
   type TableSchema,
   type ValidationIssue,
 } from "@internal/tsql";
-import { streamText, type LanguageModelV1, tool } from "ai";
+import { streamText, stepCountIs, type LanguageModel, tool } from "ai";
 import { z } from "zod";
 import type { AITimeFilter } from "~/routes/_app.orgs.$organizationSlug.projects.$projectParam.env.$envParam.query/types";
 
 // Re-export for backwards compatibility
 export type { AITimeFilter };
-
-/**
- * Stream event types for AI query generation
- */
-export type AIQueryStreamEvent =
-  | { type: "thinking"; content: string }
-  | { type: "tool_call"; tool: string; args: unknown }
-  | { type: "tool_result"; tool: string; result: unknown }
-  | { type: "time_filter"; filter: AITimeFilter }
-  | { type: "result"; success: true; query: string; timeFilter?: AITimeFilter }
-  | { type: "result"; success: false; error: string };
 
 /**
  * Result type for non-streaming call
@@ -55,7 +44,7 @@ export class AIQueryService {
 
   constructor(
     private readonly tableSchema: TableSchema[],
-    private readonly model: LanguageModelV1 = openai("gpt-4.1-mini")
+    private readonly model: LanguageModel = openai("gpt-4.1-mini")
   ) {}
 
   /**
@@ -66,7 +55,7 @@ export class AIQueryService {
     return tool({
       description:
         "Set the time filter for the query page UI instead of adding time conditions to the query. ALWAYS use this tool when the user wants to filter by time (e.g., 'last 7 days', 'past hour', 'yesterday'). The UI will apply this filter automatically using the table's time column (triggered_at for runs, bucket_start for metrics). Do NOT add triggered_at or bucket_start to the WHERE clause for time filtering - use this tool instead.",
-      parameters: z.object({
+      inputSchema: z.object({
         period: z
           .string()
           .optional()
@@ -125,7 +114,7 @@ export class AIQueryService {
         validateTSQLQuery: tool({
           description:
             "Validate a TSQL query for syntax errors and schema compliance. Always use this tool to verify your query before returning it to the user.",
-          parameters: z.object({
+          inputSchema: z.object({
             query: z.string().describe("The TSQL query to validate"),
           }),
           execute: async ({ query }) => {
@@ -135,7 +124,7 @@ export class AIQueryService {
         getTableSchema: tool({
           description:
             "Get detailed schema information about available tables and columns. Use this to understand what data is available and how to query it.",
-          parameters: z.object({
+          inputSchema: z.object({
             tableName: z
               .string()
               .optional()
@@ -147,7 +136,7 @@ export class AIQueryService {
         }),
         setTimeFilter: this.buildSetTimeFilterTool(),
       },
-      maxSteps: 5,
+      stopWhen: stepCountIs(5),
       experimental_telemetry: {
         isEnabled: true,
         metadata: {
@@ -191,7 +180,7 @@ export class AIQueryService {
         validateTSQLQuery: tool({
           description:
             "Validate a TSQL query for syntax errors and schema compliance. Always use this tool to verify your query before returning it to the user.",
-          parameters: z.object({
+          inputSchema: z.object({
             query: z.string().describe("The TSQL query to validate"),
           }),
           execute: async ({ query }) => {
@@ -201,7 +190,7 @@ export class AIQueryService {
         getTableSchema: tool({
           description:
             "Get detailed schema information about available tables and columns. Use this to understand what data is available and how to query it.",
-          parameters: z.object({
+          inputSchema: z.object({
             tableName: z
               .string()
               .optional()
@@ -213,7 +202,7 @@ export class AIQueryService {
         }),
         setTimeFilter: this.buildSetTimeFilterTool(),
       },
-      maxSteps: 5,
+      stopWhen: stepCountIs(5),
       experimental_telemetry: {
         isEnabled: true,
         metadata: {

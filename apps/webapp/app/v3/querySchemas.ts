@@ -2,7 +2,6 @@ import { column, type BucketThreshold, type TableSchema } from "@internal/tsql";
 import { z } from "zod";
 import { autoFormatSQL } from "~/components/code/TSQLEditor";
 import { runFriendlyStatus, runStatusTitleFromStatus } from "~/components/runs/v3/TaskRunStatus";
-import { logger } from "~/services/logger.server";
 
 export const QueryScopeSchema = z.enum(["organization", "project", "environment"]);
 export type QueryScope = z.infer<typeof QueryScopeSchema>;
@@ -176,20 +175,30 @@ export const runsSchema: TableSchema = {
     idempotency_key: {
       name: "idempotency_key",
       clickhouseName: "idempotency_key_user",
-      ...column("String", { description: "Idempotency key (available from 4.3.3)", example: "user-123-action-456" }),
+      ...column("String", {
+        description: "Idempotency key (available from 4.3.3)",
+        example: "user-123-action-456",
+      }),
     },
     idempotency_key_scope: {
       name: "idempotency_key_scope",
-      ...column("String", { description: "The idempotency key scope determines whether a task should be considered unique within a parent run, a specific attempt, or globally. An empty value means there's no idempotency key set (available from 4.3.3).", example: "run", allowedValues: ["global", "run", "attempt"], }),
+      ...column("String", {
+        description:
+          "The idempotency key scope determines whether a task should be considered unique within a parent run, a specific attempt, or globally. An empty value means there's no idempotency key set (available from 4.3.3).",
+        example: "run",
+        allowedValues: ["global", "run", "attempt"],
+      }),
     },
     region: {
       name: "region",
-      clickhouseName: "worker_queue",
+      clickhouseName: "region",
       ...column("String", {
         description: "Region",
         example: "us-east-1",
       }),
-      expression: "if(startsWith(worker_queue, 'cm'), NULL, worker_queue)",
+      // No whereTransform: the expression drives WHERE too, so pre-region rows still match.
+      expression:
+        "multiIf(region != '', region, startsWith(worker_queue, 'cm'), NULL, worker_queue)",
     },
 
     // Timing
@@ -404,6 +413,13 @@ export const runsSchema: TableSchema = {
       ...column("UInt8", { description: "Whether this is a test run (0 or 1)", example: "0" }),
       expression: "if(is_test > 0, true, false)",
     },
+    is_warm_start: {
+      name: "is_warm_start",
+      ...column("Nullable(UInt8)", {
+        description: "Whether this run used a warm start vs a cold start.",
+        example: "1",
+      }),
+    },
     concurrency_key: {
       name: "concurrency_key",
       ...column("String", {
@@ -426,10 +442,7 @@ export const runsSchema: TableSchema = {
       ...column("Array(String)", {
         description: "Any bulk actions that operated on this run.",
         example: '["bulk_12345678", "bulk_34567890"]',
-        whereTransform: (value: string) => {
-          logger.log(`WHERE TRANSFORM: ${value}`);
-          return value.replace(/^bulk_/, "");
-        },
+        whereTransform: (value: string) => value.replace(/^bulk_/, ""),
       }),
     },
   },
@@ -438,7 +451,7 @@ export const runsSchema: TableSchema = {
 /**
  * Schema definition for the metrics table (trigger_dev.metrics_v1)
  */
-export const metricsSchema: TableSchema = {
+const metricsSchema: TableSchema = {
   name: "metrics",
   clickhouseName: "trigger_dev.metrics_v1",
   description: "Host and runtime metrics collected during task execution",
@@ -597,9 +610,863 @@ export const metricsSchema: TableSchema = {
 };
 
 /**
- * All available schemas for the query editor
+ * Schema definition for the queue_metrics table (trigger_dev.queue_metrics_v1).
+ * Pre-aggregated into 10-second buckets. Counter columns re-aggregate with sum(),
+ * gauges with max(), and wait_quantiles with quantilesMerge() — never FINAL.
  */
-export const querySchemas: TableSchema[] = [runsSchema, metricsSchema];
+const queueMetricsSchema: TableSchema = {
+  name: "queue_metrics",
+  clickhouseName: "trigger_dev.queue_metrics_v1",
+  description: "Per-queue depth, concurrency, throttling, and scheduling-delay metrics",
+  timeConstraint: "bucket_start",
+  tenantColumns: {
+    organizationId: "organization_id",
+    projectId: "project_id",
+    environmentId: "environment_id",
+  },
+  columns: {
+    environment: {
+      name: "environment",
+      clickhouseName: "environment_id",
+      ...column("String", { description: "The environment slug", example: "prod" }),
+      fieldMapping: "environment",
+      customRenderType: "environment",
+    },
+    project: {
+      name: "project",
+      clickhouseName: "project_id",
+      ...column("String", {
+        description: "The project reference, they always start with `proj_`.",
+        example: "proj_howcnaxbfxdmwmxazktx",
+      }),
+      fieldMapping: "project",
+      customRenderType: "project",
+    },
+    queue: {
+      name: "queue",
+      clickhouseName: "queue_name",
+      ...column("LowCardinality(String)", {
+        description: "The queue name",
+        example: "my-queue",
+        coreColumn: true,
+      }),
+    },
+    bucket_start: {
+      name: "bucket_start",
+      ...column("DateTime", {
+        description: "The start of the 10-second aggregation bucket",
+        example: "2024-01-15 09:30:00",
+        coreColumn: true,
+      }),
+    },
+    // Cumulative-counter delta states. Read with deltaSumTimestampMerge(<col>) (loss-tolerant,
+    // reset-safe), never sum(); opaque like wait_quantiles. Merging across queues is
+    // invalid (mixes unrelated odometers): totals must GROUP BY queue, then sum outside.
+    enqueue_delta: {
+      name: "enqueue_delta",
+      mergeGroupKey: "queue",
+      ...column("String", {
+        description:
+          "Runs enqueued (cumulative-counter delta). Read with deltaSumTimestampMerge(enqueue_delta) grouped by queue. For totals across queues, sum the per-queue results in an outer query, never merge across queues. Per-bucket values can undercount by one inter-reading delta at bucket boundaries (the bridge lives in the prior bucket's state); totals over the whole range are exact.",
+      }),
+      groupable: false,
+      sortable: false,
+      filterable: false,
+    },
+    started_delta: {
+      name: "started_delta",
+      mergeGroupKey: "queue",
+      ...column("String", {
+        description:
+          "Runs dequeued/started (throughput). Read with deltaSumTimestampMerge(started_delta) grouped by queue. For totals across queues, sum the per-queue results in an outer query, never merge across queues. Per-bucket values can undercount by one inter-reading delta at bucket boundaries (the bridge lives in the prior bucket's state); totals over the whole range are exact.",
+        coreColumn: true,
+      }),
+      groupable: false,
+      sortable: false,
+      filterable: false,
+    },
+    ack_delta: {
+      name: "ack_delta",
+      mergeGroupKey: "queue",
+      ...column("String", {
+        description:
+          "Runs acked (completed). Read with deltaSumTimestampMerge(ack_delta) grouped by queue; sum per-queue results for totals.",
+      }),
+      groupable: false,
+      sortable: false,
+      filterable: false,
+    },
+    nack_delta: {
+      name: "nack_delta",
+      mergeGroupKey: "queue",
+      ...column("String", {
+        description:
+          "Runs nacked. Read with deltaSumTimestampMerge(nack_delta) grouped by queue; sum per-queue results for totals.",
+      }),
+      groupable: false,
+      sortable: false,
+      filterable: false,
+    },
+    dlq_delta: {
+      name: "dlq_delta",
+      mergeGroupKey: "queue",
+      ...column("String", {
+        description:
+          "Runs dead-lettered. Read with deltaSumTimestampMerge(dlq_delta) grouped by queue; sum per-queue results for totals.",
+      }),
+      groupable: false,
+      sortable: false,
+      filterable: false,
+    },
+    throttled_count: {
+      name: "throttled_count",
+      ...column("UInt64", {
+        description: "Gauge emissions where running>=limit and queued>0. Aggregate with sum().",
+        coreColumn: true,
+      }),
+    },
+    max_queued: {
+      name: "max_queued",
+      ...column("UInt32", {
+        description: "Peak queue depth in the bucket. Aggregate with max().",
+        coreColumn: true,
+        fillMode: "carry",
+      }),
+    },
+    max_running: {
+      name: "max_running",
+      ...column("UInt32", {
+        description: "Peak running (concurrency) in the bucket. Aggregate with max().",
+        coreColumn: true,
+        fillMode: "carry",
+      }),
+    },
+    max_limit: {
+      name: "max_limit",
+      ...column("UInt32", {
+        description: "The queue concurrency limit. Aggregate with max().",
+        coreColumn: true,
+        fillMode: "carry",
+      }),
+    },
+    max_env_queued: {
+      name: "max_env_queued",
+      ...column("UInt32", {
+        description: "Peak environment-wide queued in the bucket. Aggregate with max().",
+        fillMode: "carry",
+      }),
+    },
+    max_env_running: {
+      name: "max_env_running",
+      ...column("UInt32", {
+        description: "Peak environment-wide running in the bucket. Aggregate with max().",
+        fillMode: "carry",
+      }),
+    },
+    max_env_limit: {
+      name: "max_env_limit",
+      ...column("UInt32", {
+        description: "The environment concurrency limit. Aggregate with max().",
+        fillMode: "carry",
+      }),
+    },
+    max_ck_backlogged: {
+      name: "max_ck_backlogged",
+      ...column("UInt32", {
+        description:
+          "Peak number of distinct concurrency keys with queued runs in the bucket. Aggregate with max(). Zero for queues that do not use concurrency keys.",
+        fillMode: "carry",
+      }),
+    },
+    max_ck_wait_ms: {
+      name: "max_ck_wait_ms",
+      ...column("UInt32", {
+        description:
+          "Worst head-of-line wait (ms) across concurrency keys in the bucket: how long the most-starved key's oldest queued run has been waiting. Aggregate with max(). Zero for queues that do not use concurrency keys.",
+        fillMode: "carry",
+      }),
+    },
+    wait_ms_sum: {
+      name: "wait_ms_sum",
+      ...column("UInt64", {
+        description: "Sum of scheduling delays (ms). Mean = wait_ms_sum/wait_ms_count.",
+      }),
+    },
+    wait_ms_count: {
+      name: "wait_ms_count",
+      ...column("UInt64", {
+        description: "Count of scheduling-delay samples. Aggregate with sum().",
+      }),
+    },
+    wait_quantiles: {
+      name: "wait_quantiles",
+      ...column("String", {
+        description:
+          "Scheduling-delay (dequeue minus eligible-at) quantile state. Read with quantilesMerge(0.5,0.9,0.95,0.99)(wait_quantiles)[n].",
+      }),
+      groupable: false,
+      sortable: false,
+      filterable: false,
+    },
+  },
+  timeBucketThresholds: [
+    { maxRangeSeconds: 3 * 60 * 60, interval: { value: 10, unit: "SECOND" } },
+    { maxRangeSeconds: 12 * 60 * 60, interval: { value: 1, unit: "MINUTE" } },
+    { maxRangeSeconds: 2 * 24 * 60 * 60, interval: { value: 5, unit: "MINUTE" } },
+    { maxRangeSeconds: 7 * 24 * 60 * 60, interval: { value: 15, unit: "MINUTE" } },
+    { maxRangeSeconds: 30 * 24 * 60 * 60, interval: { value: 1, unit: "HOUR" } },
+    { maxRangeSeconds: 90 * 24 * 60 * 60, interval: { value: 6, unit: "HOUR" } },
+    { maxRangeSeconds: 180 * 24 * 60 * 60, interval: { value: 1, unit: "DAY" } },
+    { maxRangeSeconds: 365 * 24 * 60 * 60, interval: { value: 1, unit: "WEEK" } },
+  ] satisfies BucketThreshold[],
+  // Ranges whose bucket interval is >= 5 minutes read the 5m rollup instead (same
+  // logical columns, ~30x fewer rows).
+  rollups: [{ minIntervalSeconds: 300, clickhouseName: "trigger_dev.queue_metrics_5m_v1" }],
+  queryCache: { ttlSeconds: 30, alignSeconds: 30 },
+  queryClient: "queueMetrics",
+};
+
+/**
+ * Schema definition for the env_metrics table (trigger_dev.env_metrics_v1).
+ * Environment-level rollup of queue_metrics with the queue dimension dropped, so
+ * header tiles and saturation charts cost the same regardless of how many queues
+ * the environment has. Keeps the full 10-second granularity: row count is
+ * queue-independent, so even 30-day ranges stay small.
+ */
+export const envMetricsSchema: TableSchema = {
+  name: "env_metrics",
+  clickhouseName: "trigger_dev.env_metrics_v1",
+  description:
+    "Environment-level concurrency, saturation, throttling, and scheduling-delay metrics (10-second buckets)",
+  timeConstraint: "bucket_start",
+  tenantColumns: {
+    organizationId: "organization_id",
+    projectId: "project_id",
+    environmentId: "environment_id",
+  },
+  columns: {
+    environment: {
+      name: "environment",
+      clickhouseName: "environment_id",
+      ...column("String", { description: "The environment slug", example: "prod" }),
+      fieldMapping: "environment",
+      customRenderType: "environment",
+    },
+    project: {
+      name: "project",
+      clickhouseName: "project_id",
+      ...column("String", {
+        description: "The project reference, they always start with `proj_`.",
+        example: "proj_howcnaxbfxdmwmxazktx",
+      }),
+      fieldMapping: "project",
+      customRenderType: "project",
+    },
+    bucket_start: {
+      name: "bucket_start",
+      ...column("DateTime", {
+        description: "The start of the 10-second aggregation bucket",
+        example: "2024-01-15 09:30:00",
+        coreColumn: true,
+      }),
+    },
+    max_env_queued: {
+      name: "max_env_queued",
+      ...column("UInt32", {
+        description: "Peak environment-wide queued in the bucket. Aggregate with max().",
+        coreColumn: true,
+        fillMode: "carry",
+      }),
+    },
+    max_env_running: {
+      name: "max_env_running",
+      ...column("UInt32", {
+        description: "Peak environment-wide running in the bucket. Aggregate with max().",
+        coreColumn: true,
+        fillMode: "carry",
+      }),
+    },
+    max_env_limit: {
+      name: "max_env_limit",
+      ...column("UInt32", {
+        description: "The environment concurrency limit. Aggregate with max().",
+        coreColumn: true,
+        fillMode: "carry",
+      }),
+    },
+    throttled_count: {
+      name: "throttled_count",
+      ...column("UInt64", {
+        description:
+          "Gauge emissions where a queue was at its limit with work queued. Aggregate with sum().",
+        coreColumn: true,
+      }),
+    },
+    wait_ms_sum: {
+      name: "wait_ms_sum",
+      ...column("UInt64", {
+        description: "Sum of scheduling delays (ms). Mean = wait_ms_sum/wait_ms_count.",
+      }),
+    },
+    wait_ms_count: {
+      name: "wait_ms_count",
+      ...column("UInt64", {
+        description: "Count of scheduling-delay samples. Aggregate with sum().",
+      }),
+    },
+    wait_quantiles: {
+      name: "wait_quantiles",
+      ...column("String", {
+        description:
+          "Scheduling-delay quantile state (TDigest). Read with quantilesTDigestMerge(0.5,0.9,0.95,0.99)(wait_quantiles)[n].",
+      }),
+      groupable: false,
+      sortable: false,
+      filterable: false,
+    },
+  },
+  timeBucketThresholds: [
+    { maxRangeSeconds: 3 * 60 * 60, interval: { value: 10, unit: "SECOND" } },
+    { maxRangeSeconds: 12 * 60 * 60, interval: { value: 1, unit: "MINUTE" } },
+    { maxRangeSeconds: 2 * 24 * 60 * 60, interval: { value: 5, unit: "MINUTE" } },
+    { maxRangeSeconds: 7 * 24 * 60 * 60, interval: { value: 15, unit: "MINUTE" } },
+    { maxRangeSeconds: 30 * 24 * 60 * 60, interval: { value: 1, unit: "HOUR" } },
+    { maxRangeSeconds: 90 * 24 * 60 * 60, interval: { value: 6, unit: "HOUR" } },
+    { maxRangeSeconds: 180 * 24 * 60 * 60, interval: { value: 1, unit: "DAY" } },
+    { maxRangeSeconds: 365 * 24 * 60 * 60, interval: { value: 1, unit: "WEEK" } },
+  ] satisfies BucketThreshold[],
+  queryCache: { ttlSeconds: 30, alignSeconds: 30 },
+  queryClient: "queueMetrics",
+};
+
+/**
+ * Schema definition for the llm_metrics table (trigger_dev.llm_metrics_v1)
+ */
+const llmMetricsSchema: TableSchema = {
+  name: "llm_metrics",
+  clickhouseName: "trigger_dev.llm_metrics_v1",
+  description: "LLM metrics: token usage, cost, performance, and behavior from GenAI spans",
+  timeConstraint: "start_time",
+  tenantColumns: {
+    organizationId: "organization_id",
+    projectId: "project_id",
+    environmentId: "environment_id",
+  },
+  columns: {
+    environment: {
+      name: "environment",
+      clickhouseName: "environment_id",
+      ...column("String", { description: "The environment slug", example: "prod" }),
+      fieldMapping: "environment",
+      customRenderType: "environment",
+    },
+    project: {
+      name: "project",
+      clickhouseName: "project_id",
+      ...column("String", {
+        description: "The project reference, they always start with `proj_`.",
+        example: "proj_howcnaxbfxdmwmxazktx",
+      }),
+      fieldMapping: "project",
+      customRenderType: "project",
+    },
+    run_id: {
+      name: "run_id",
+      ...column("String", {
+        description: "The run ID",
+        customRenderType: "runId",
+        coreColumn: true,
+      }),
+    },
+    trace_id: {
+      name: "trace_id",
+      ...column("String", {
+        description: "The trace ID",
+      }),
+    },
+    span_id: {
+      name: "span_id",
+      ...column("String", {
+        description: "The span ID",
+      }),
+    },
+    task_identifier: {
+      name: "task_identifier",
+      ...column("LowCardinality(String)", {
+        description: "The task identifier",
+        example: "my-task",
+        coreColumn: true,
+      }),
+    },
+    gen_ai_system: {
+      name: "gen_ai_system",
+      ...column("LowCardinality(String)", {
+        description: "AI provider (e.g. openai, anthropic)",
+        example: "openai",
+        coreColumn: true,
+      }),
+    },
+    request_model: {
+      name: "request_model",
+      ...column("String", {
+        description: "The model name requested",
+        example: "gpt-4o",
+      }),
+    },
+    response_model: {
+      name: "response_model",
+      ...column("String", {
+        description: "The model name returned by the provider",
+        example: "gpt-4o-2024-08-06",
+        coreColumn: true,
+      }),
+    },
+    operation_id: {
+      name: "operation_id",
+      ...column("LowCardinality(String)", {
+        description: "Operation type (e.g. ai.streamText.doStream, ai.generateText.doGenerate)",
+        example: "ai.streamText.doStream",
+      }),
+    },
+    finish_reason: {
+      name: "finish_reason",
+      ...column("LowCardinality(String)", {
+        description: "Why the LLM stopped generating (e.g. stop, tool-calls, length)",
+        example: "stop",
+        coreColumn: true,
+      }),
+    },
+    cost_source: {
+      name: "cost_source",
+      ...column("LowCardinality(String)", {
+        description: "Where cost data came from (registry, gateway, openrouter)",
+        example: "registry",
+      }),
+    },
+    input_tokens: {
+      name: "input_tokens",
+      ...column("UInt64", {
+        description: "Number of input tokens",
+        example: "702",
+      }),
+    },
+    output_tokens: {
+      name: "output_tokens",
+      ...column("UInt64", {
+        description: "Number of output tokens",
+        example: "22",
+      }),
+    },
+    total_tokens: {
+      name: "total_tokens",
+      ...column("UInt64", {
+        description: "Total token count",
+        example: "724",
+      }),
+    },
+    cached_read_tokens: {
+      name: "cached_read_tokens",
+      ...column("UInt64", {
+        description:
+          "Input tokens served from the provider's prompt cache (cheaper than regular input tokens). Supported by Anthropic and OpenAI.",
+        example: "8200",
+      }),
+      expression: "usage_details['input_cached_tokens']",
+    },
+    cache_creation_tokens: {
+      name: "cache_creation_tokens",
+      ...column("UInt64", {
+        description:
+          "Input tokens written to create a new prompt cache entry. Supported by Anthropic.",
+        example: "1751",
+      }),
+      expression: "usage_details['cache_creation_input_tokens']",
+    },
+    reasoning_tokens: {
+      name: "reasoning_tokens",
+      ...column("UInt64", {
+        description:
+          "Tokens used for chain-of-thought reasoning (e.g. OpenAI o-series, DeepSeek R1). These count toward output but are not visible in the response.",
+        example: "512",
+      }),
+      expression: "usage_details['reasoning_tokens']",
+    },
+    input_cost: {
+      name: "input_cost",
+      ...column("Decimal64(12)", {
+        description: "Input cost in USD (from pricing registry)",
+        customRenderType: "costInDollars",
+      }),
+    },
+    output_cost: {
+      name: "output_cost",
+      ...column("Decimal64(12)", {
+        description: "Output cost in USD (from pricing registry)",
+        customRenderType: "costInDollars",
+      }),
+    },
+    total_cost: {
+      name: "total_cost",
+      ...column("Decimal64(12)", {
+        description: "Total cost in USD",
+        customRenderType: "costInDollars",
+        coreColumn: true,
+      }),
+    },
+    cached_read_cost: {
+      name: "cached_read_cost",
+      ...column("Decimal64(12)", {
+        description:
+          "Cost of cached input tokens (discounted vs regular input). Only present when the pricing tier has a separate cached input price.",
+        customRenderType: "costInDollars",
+      }),
+      expression: "cost_details['input_cached_tokens']",
+    },
+    cache_creation_cost: {
+      name: "cache_creation_cost",
+      ...column("Decimal64(12)", {
+        description: "Cost of tokens written to create a prompt cache entry.",
+        customRenderType: "costInDollars",
+      }),
+      expression: "cost_details['cache_creation_input_tokens']",
+    },
+    provider_cost: {
+      name: "provider_cost",
+      ...column("Decimal64(12)", {
+        description: "Provider-reported cost in USD (from gateway or openrouter)",
+        customRenderType: "costInDollars",
+      }),
+    },
+    ms_to_first_chunk: {
+      name: "ms_to_first_chunk",
+      ...column("Float64", {
+        description: "Time to first chunk in milliseconds (TTFC)",
+        example: "245.3",
+        coreColumn: true,
+      }),
+    },
+    tokens_per_second: {
+      name: "tokens_per_second",
+      ...column("Float64", {
+        description: "Average output tokens per second",
+        example: "72.5",
+      }),
+    },
+    pricing_tier_name: {
+      name: "pricing_tier_name",
+      ...column("LowCardinality(String)", {
+        description: "The matched pricing tier name",
+        example: "Standard",
+      }),
+    },
+    start_time: {
+      name: "start_time",
+      ...column("DateTime64(9)", {
+        description: "When the LLM call started",
+        coreColumn: true,
+      }),
+    },
+    duration: {
+      name: "duration",
+      ...column("UInt64", {
+        description: "Span duration in nanoseconds",
+        customRenderType: "durationNs",
+      }),
+    },
+    prompt_slug: {
+      name: "prompt_slug",
+      ...column("LowCardinality(String)", {
+        description: "The managed prompt slug used for this LLM call",
+        example: "customer-support",
+        coreColumn: true,
+      }),
+    },
+    prompt_version: {
+      name: "prompt_version",
+      ...column("UInt32", {
+        description: "The managed prompt version number used for this LLM call",
+        example: "3",
+      }),
+    },
+    metadata: {
+      name: "metadata",
+      ...column("Map(LowCardinality(String), String)", {
+        description:
+          "Key-value metadata from run tags (key:value format) and AI SDK telemetry metadata. Access keys with dot notation (metadata.userId) or bracket syntax (metadata['userId']).",
+        example: "{'userId':'user_123','org':'acme'}",
+      }),
+    },
+  },
+};
+
+/**
+ * Schema definition for the llm_models table (trigger_dev.llm_model_aggregates_v1)
+ * Global table — no tenant columns. Contains anonymized cross-tenant model performance data.
+ */
+const llmModelsSchema: TableSchema = {
+  name: "llm_models",
+  clickhouseName: "trigger_dev.llm_model_aggregates_v1",
+  description:
+    "Cross-tenant model performance aggregates: calls, cost, latency, and throughput per model per minute. No tenant-specific data.",
+  timeConstraint: "minute",
+  // No tenantColumns — this is a global table with anonymized data
+  columns: {
+    response_model: {
+      name: "response_model",
+      ...column("String", {
+        description: "The model name as returned by the provider",
+        example: "gpt-4o-2024-08-06",
+        coreColumn: true,
+      }),
+    },
+    base_response_model: {
+      name: "base_response_model",
+      ...column("String", {
+        description: "The base model name with dated variants grouped",
+        example: "gpt-4o",
+        coreColumn: true,
+      }),
+    },
+    gen_ai_system: {
+      name: "gen_ai_system",
+      ...column("String", {
+        description: "The AI provider system identifier",
+        example: "openai.responses",
+        coreColumn: true,
+      }),
+    },
+    minute: {
+      name: "minute",
+      ...column("DateTime", {
+        description: "Aggregation time bucket (per minute)",
+        coreColumn: true,
+      }),
+    },
+    call_count: {
+      name: "call_count",
+      ...column("UInt64", {
+        description: "Number of LLM calls in this time bucket",
+        coreColumn: true,
+      }),
+    },
+    total_input_tokens: {
+      name: "total_input_tokens",
+      ...column("UInt64", {
+        description: "Total input tokens consumed",
+      }),
+    },
+    total_output_tokens: {
+      name: "total_output_tokens",
+      ...column("UInt64", {
+        description: "Total output tokens generated",
+      }),
+    },
+    total_cost: {
+      name: "total_cost",
+      ...column("Float64", {
+        description: "Total cost in USD",
+        customRenderType: "costInDollars",
+        coreColumn: true,
+      }),
+    },
+    // Aggregate state columns — use quantilesMerge() in queries to extract values
+    // Example: quantilesMerge(0.5)(ttfc_quantiles)[1] AS ttfc_p50
+    ttfc_quantiles: {
+      name: "ttfc_quantiles",
+      ...column("String", {
+        description:
+          "Time to first chunk quantile state. Use quantilesMerge(0.5)(ttfc_quantiles)[1] AS ttfc_p50 in queries.",
+        example: "quantilesMerge(0.5)(ttfc_quantiles)[1]",
+      }),
+    },
+    tps_quantiles: {
+      name: "tps_quantiles",
+      ...column("String", {
+        description:
+          "Tokens per second quantile state. Use quantilesMerge(0.5)(tps_quantiles)[1] AS tps_p50 in queries.",
+        example: "quantilesMerge(0.5)(tps_quantiles)[1]",
+      }),
+    },
+    duration_quantiles: {
+      name: "duration_quantiles",
+      ...column("String", {
+        description:
+          "Duration quantile state. Use quantilesMerge(0.5)(duration_quantiles)[1] AS duration_p50 in queries.",
+        example: "quantilesMerge(0.5)(duration_quantiles)[1]",
+      }),
+    },
+  },
+};
+
+/**
+ * Per-concurrency-key drill-down for queues that shard work with `concurrencyKey`
+ * (e.g. per-tenant fairness). Rows are activity-bound: a (queue, key, bucket) row exists
+ * only when that key had events, so key cardinality cannot inflate the table.
+ */
+const queueMetricsByKeySchema: TableSchema = {
+  name: "queue_metrics_by_key",
+  clickhouseName: "trigger_dev.queue_metrics_ck_v1",
+  description: "Per-concurrency-key queue metrics: backlog, throughput, and wait by key",
+  hidden: true,
+  timeConstraint: "bucket_start",
+  tenantColumns: {
+    organizationId: "organization_id",
+    projectId: "project_id",
+    environmentId: "environment_id",
+  },
+  columns: {
+    environment: {
+      name: "environment",
+      clickhouseName: "environment_id",
+      ...column("String", { description: "The environment slug", example: "prod" }),
+      fieldMapping: "environment",
+      customRenderType: "environment",
+    },
+    project: {
+      name: "project",
+      clickhouseName: "project_id",
+      ...column("String", {
+        description: "The project reference, they always start with `proj_`.",
+        example: "proj_howcnaxbfxdmwmxazktx",
+      }),
+      fieldMapping: "project",
+      customRenderType: "project",
+    },
+    queue: {
+      name: "queue",
+      clickhouseName: "queue_name",
+      ...column("LowCardinality(String)", {
+        description: "The queue name",
+        example: "my-queue",
+        coreColumn: true,
+      }),
+    },
+    concurrency_key: {
+      name: "concurrency_key",
+      ...column("String", {
+        description: "The concurrency key the run was sharded by (e.g. a tenant id)",
+        example: "tenant-42",
+        coreColumn: true,
+      }),
+    },
+    bucket_start: {
+      name: "bucket_start",
+      ...column("DateTime", {
+        description: "The start of the 10-second aggregation bucket",
+        example: "2024-01-15 09:30:00",
+        coreColumn: true,
+      }),
+    },
+    enqueue_delta: {
+      name: "enqueue_delta",
+      mergeGroupKey: ["queue", "concurrency_key"],
+      ...column("String", {
+        description:
+          "Runs enqueued for this key (cumulative-counter delta). Read with deltaSumTimestampMerge(enqueue_delta) grouped by queue and concurrency_key, or with both pinned; never merge across keys.",
+      }),
+      groupable: false,
+      sortable: false,
+      filterable: false,
+    },
+    started_delta: {
+      name: "started_delta",
+      mergeGroupKey: ["queue", "concurrency_key"],
+      ...column("String", {
+        description:
+          "Runs dequeued/started for this key (throughput). Read with deltaSumTimestampMerge(started_delta) grouped by queue and concurrency_key, or with both pinned; never merge across keys.",
+        coreColumn: true,
+      }),
+      groupable: false,
+      sortable: false,
+      filterable: false,
+    },
+    ack_delta: {
+      name: "ack_delta",
+      mergeGroupKey: ["queue", "concurrency_key"],
+      ...column("String", {
+        description:
+          "Runs acked (completed) for this key. Read with deltaSumTimestampMerge(ack_delta) grouped by queue and concurrency_key, or with both pinned.",
+      }),
+      groupable: false,
+      sortable: false,
+      filterable: false,
+    },
+    max_queued: {
+      name: "max_queued",
+      ...column("UInt32", {
+        description: "Peak backlog for this key in the bucket. Aggregate with max().",
+        coreColumn: true,
+        fillMode: "carry",
+      }),
+    },
+    max_running: {
+      name: "max_running",
+      ...column("UInt32", {
+        description: "Peak running for this key in the bucket. Aggregate with max().",
+        fillMode: "carry",
+      }),
+    },
+    wait_ms_sum: {
+      name: "wait_ms_sum",
+      ...column("UInt64", {
+        description:
+          "Sum of scheduling delays (ms) for this key. Mean = wait_ms_sum/wait_ms_count.",
+      }),
+    },
+    wait_ms_count: {
+      name: "wait_ms_count",
+      ...column("UInt64", {
+        description: "Count of scheduling-delay samples for this key. Aggregate with sum().",
+      }),
+    },
+  },
+  timeBucketThresholds: [
+    { maxRangeSeconds: 3 * 60 * 60, interval: { value: 10, unit: "SECOND" } },
+    { maxRangeSeconds: 12 * 60 * 60, interval: { value: 1, unit: "MINUTE" } },
+    { maxRangeSeconds: 2 * 24 * 60 * 60, interval: { value: 5, unit: "MINUTE" } },
+    { maxRangeSeconds: 7 * 24 * 60 * 60, interval: { value: 15, unit: "MINUTE" } },
+    { maxRangeSeconds: 30 * 24 * 60 * 60, interval: { value: 1, unit: "HOUR" } },
+    { maxRangeSeconds: 90 * 24 * 60 * 60, interval: { value: 6, unit: "HOUR" } },
+    { maxRangeSeconds: 180 * 24 * 60 * 60, interval: { value: 1, unit: "DAY" } },
+    { maxRangeSeconds: 365 * 24 * 60 * 60, interval: { value: 1, unit: "WEEK" } },
+  ] satisfies BucketThreshold[],
+  queryCache: { ttlSeconds: 30, alignSeconds: 30 },
+  queryClient: "queueMetrics",
+};
+
+export const querySchemas: TableSchema[] = [
+  runsSchema,
+  metricsSchema,
+  llmMetricsSchema,
+  llmModelsSchema,
+  queueMetricsSchema,
+  envMetricsSchema,
+  queueMetricsByKeySchema,
+];
+
+/** Tables whose listing is deferred until queue metrics are rolled out. */
+const QUEUE_METRICS_TABLE_NAMES = new Set([
+  queueMetricsSchema.name,
+  envMetricsSchema.name,
+  queueMetricsByKeySchema.name,
+]);
+
+/**
+ * Schemas shown in user-facing listings (editor autocomplete, schema docs, schema API, AI query
+ * context). Listing only: `querySchemas` stays the compile-time set, so a query naming an unlisted
+ * table still runs, with tenancy enforced as usual.
+ *
+ * Server callers pass `env.QUEUE_METRICS_QUERY_TABLES_VISIBLE === "1"`; client callers read
+ * `queueMetricsQueryTables` from `useFeatures()`. This module is imported by browser code, so it
+ * must not reach for `env.server` itself.
+ */
+export function listableQuerySchemas(options: { includeQueueMetrics: boolean }): TableSchema[] {
+  return querySchemas.filter((s) => {
+    if (s.hidden) return false;
+    if (!options.includeQueueMetrics && QUEUE_METRICS_TABLE_NAMES.has(s.name)) return false;
+    return true;
+  });
+}
 
 /**
  * Default query for the query editor

@@ -1,17 +1,16 @@
 import { ScheduleEngine } from "@internal/schedule-engine";
+import type { TriggerScheduledTaskErrorType } from "@internal/schedule-engine";
 import { stringifyIO } from "@trigger.dev/core/v3";
 import { prisma } from "~/db.server";
 import { env } from "~/env.server";
 import { devPresence } from "~/presenters/v3/DevPresence.server";
 import { logger } from "~/services/logger.server";
 import { singleton } from "~/utils/singleton";
-import { TriggerTaskService } from "./services/triggerTask.server";
+import { OutOfEntitlementError, TriggerTaskService } from "./services/triggerTask.server";
 import { meter, tracer } from "./tracer.server";
-import { workerQueue } from "~/services/worker.server";
+import { ServiceValidationError } from "./services/common.server";
 
 export const scheduleEngine = singleton("ScheduleEngine", createScheduleEngine);
-
-export type { ScheduleEngine };
 
 async function isDevEnvironmentConnectedHandler(environmentId: string) {
   const environment = await prisma.runtimeEnvironment.findFirst({
@@ -71,6 +70,8 @@ function createScheduleEngine() {
     distributionWindow: {
       seconds: env.SCHEDULE_WORKER_DISTRIBUTION_WINDOW_SECONDS,
     },
+    schedulePhaseSecret: env.ENCRYPTION_KEY,
+    cronSpreadFraction: env.SCHEDULE_WORKER_CRON_SPREAD_FRACTION,
     tracer,
     meter,
     onTriggerScheduledTask: async ({
@@ -80,8 +81,18 @@ function createScheduleEngine() {
       scheduleInstanceId,
       scheduleId,
       exactScheduleTime,
+      effectiveScheduleTime,
     }) => {
       try {
+        // v3 (engine V1) is retired: skip firing V1 schedules instead of triggering into a guaranteed rejection every tick.
+        if (environment.project.engine === "V1") {
+          logger.debug("[ScheduleEngine] Skipping scheduled fire for shut-down v3 project", {
+            taskIdentifier,
+            scheduleId,
+          });
+          return { success: true };
+        }
+
         // This will trigger either v1 or v2 depending on the engine of the project
         const triggerService = new TriggerTaskService();
 
@@ -94,6 +105,7 @@ function createScheduleEngine() {
           scheduleInstanceId,
           scheduleId,
           exactScheduleTime,
+          effectiveScheduleTime,
         });
 
         const result = await triggerService.call(
@@ -104,38 +116,39 @@ function createScheduleEngine() {
             customIcon: "scheduled",
             scheduleId,
             scheduleInstanceId,
-            queueTimestamp: exactScheduleTime,
+            queueTimestamp: effectiveScheduleTime,
             overrideCreatedAt: exactScheduleTime,
+            triggerSource: "schedule",
+            triggerAction: "trigger",
           }
         );
 
         return { success: !!result };
       } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        let errorType: TriggerScheduledTaskErrorType = "SYSTEM_ERROR";
+
+        if (
+          error instanceof ServiceValidationError &&
+          errorMessage.includes("queue size limit for this environment has been reached")
+        ) {
+          errorType = "QUEUE_LIMIT";
+        } else if (error instanceof OutOfEntitlementError) {
+          // The org is out of entitlements. This is an expected outcome, not a
+          // system error, so the engine logs it as a warning rather than
+          // reporting it as an error.
+          errorType = "OUT_OF_ENTITLEMENTS";
+        }
+
         return {
           success: false,
-          error: error instanceof Error ? error.message : String(error),
+          error: errorMessage,
+          errorType,
         };
       }
     },
     isDevEnvironmentConnectedHandler: isDevEnvironmentConnectedHandler,
-    onRegisterScheduleInstance: removeDeprecatedWorkerQueueItem,
   });
 
   return engine;
-}
-
-async function removeDeprecatedWorkerQueueItem(instanceId: string) {
-  // We need to dequeue the instance from the existing workerQueue
-  try {
-    await workerQueue.dequeue(`scheduled-task-instance:${instanceId}`);
-
-    logger.debug("Removed deprecated worker queue item", {
-      instanceId,
-    });
-  } catch (error) {
-    logger.error("Error dequeuing scheduled task instance from deprecated queue", {
-      instanceId,
-      error: error instanceof Error ? error.message : String(error),
-    });
-  }
 }

@@ -1,20 +1,22 @@
 import {
+  type TriggerConfig,
   BuildManifest,
   type HandleErrorFunction,
   indexerToWorkerMessages,
   resourceCatalog,
+  type PromptManifest,
   type TaskManifest,
-  TriggerConfig,
 } from "@trigger.dev/core/v3";
 import {
+  type TracingDiagnosticLogLevel,
   StandardResourceCatalog,
-  TracingDiagnosticLogLevel,
   TracingSDK,
 } from "@trigger.dev/core/v3/workers";
 import { sendMessageInCatalog, ZodSchemaParsedError } from "@trigger.dev/core/v3/zodMessageHandler";
 import { readFile } from "node:fs/promises";
 import sourceMapSupport from "source-map-support";
 import { registerResources } from "../indexing/registerResources.js";
+import { reportTaskIdCollisions } from "../indexing/reportTaskIdCollisions.js";
 import { env } from "std-env";
 import { normalizeImportPath } from "../utilities/normalizeImportPath.js";
 import { detectRuntimeVersion } from "@trigger.dev/core/v3/build";
@@ -26,30 +28,39 @@ sourceMapSupport.install({
   hookRequire: false,
 });
 
+function safeSend(message: unknown) {
+  if (!process.connected || !process.send) {
+    return;
+  }
+  try {
+    process.send(message);
+  } catch {
+    // swallow: a throw here would re-enter this handler and busy-loop the worker
+  }
+}
+
 process.on("uncaughtException", function (error, origin) {
   if (error instanceof Error) {
-    process.send &&
-      process.send({
-        type: "UNCAUGHT_EXCEPTION",
-        payload: {
-          error: { name: error.name, message: error.message, stack: error.stack },
-          origin,
-        },
-        version: "v1",
-      });
+    safeSend({
+      type: "UNCAUGHT_EXCEPTION",
+      payload: {
+        error: { name: error.name, message: error.message, stack: error.stack },
+        origin,
+      },
+      version: "v1",
+    });
   } else {
-    process.send &&
-      process.send({
-        type: "UNCAUGHT_EXCEPTION",
-        payload: {
-          error: {
-            name: "Error",
-            message: typeof error === "string" ? error : JSON.stringify(error),
-          },
-          origin,
+    safeSend({
+      type: "UNCAUGHT_EXCEPTION",
+      payload: {
+        error: {
+          name: "Error",
+          message: typeof error === "string" ? error : JSON.stringify(error),
         },
-        version: "v1",
-      });
+        origin,
+      },
+      version: "v1",
+    });
   }
 });
 
@@ -101,6 +112,15 @@ async function bootstrap() {
 
 const { buildManifest, importErrors, config, timings } = await bootstrap();
 
+// Fail indexing if two task definitions share an id (across files and task
+// types). The catalog keys tasks by id, so without this the second definition
+// would silently overwrite the first.
+if (await reportTaskIdCollisions(safeSend)) {
+  // Give the message time to flush before the parent kills the worker.
+  await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  process.exit(0);
+}
+
 let tasks = await convertSchemasToJsonSchemas(resourceCatalog.listTaskManifests());
 
 // If the config has retry defaults, we need to apply them to all tasks that don't have any retry settings
@@ -124,6 +144,20 @@ if (typeof config.maxDuration === "number") {
       return {
         ...task,
         maxDuration: config.maxDuration,
+      } satisfies TaskManifest;
+    }
+
+    return task;
+  });
+}
+
+// If the config has a TTL, we need to apply it to all tasks that don't have a TTL
+if (config.ttl !== undefined) {
+  tasks = tasks.map((task) => {
+    if (task.ttl === undefined) {
+      return {
+        ...task,
+        ttl: config.ttl,
       } satisfies TaskManifest;
     }
 
@@ -155,6 +189,8 @@ await sendMessageInCatalog(
   {
     manifest: {
       tasks,
+      prompts: convertPromptSchemasToJsonSchemas(resourceCatalog.listPromptManifests()),
+      skills: resourceCatalog.listSkillManifests(),
       queues: resourceCatalog.listQueueManifests(),
       configPath: buildManifest.configPath,
       runtime: buildManifest.runtime,
@@ -168,14 +204,14 @@ await sendMessageInCatalog(
         typeof processKeepAlive === "object"
           ? processKeepAlive
           : typeof processKeepAlive === "boolean"
-          ? { enabled: processKeepAlive }
-          : undefined,
+            ? { enabled: processKeepAlive }
+            : undefined,
       timings,
     },
     importErrors,
   },
   async (msg) => {
-    process.send?.(msg);
+    safeSend(msg);
   }
 ).catch((err) => {
   if (err instanceof ZodSchemaParsedError) {
@@ -184,7 +220,7 @@ await sendMessageInCatalog(
       "TASKS_FAILED_TO_PARSE",
       { zodIssues: err.error.issues, tasks },
       async (msg) => {
-        process.send?.(msg);
+        safeSend(msg);
       }
     );
   } else {
@@ -199,6 +235,23 @@ await new Promise<void>((resolve) => {
     resolve();
   }, 10);
 });
+
+function convertPromptSchemasToJsonSchemas(prompts: PromptManifest[]): PromptManifest[] {
+  return prompts.map((prompt) => {
+    const schema = resourceCatalog.getPromptSchema(prompt.id);
+
+    if (schema) {
+      try {
+        const result = schemaToJsonSchema(schema);
+        return { ...prompt, variableSchema: result?.jsonSchema };
+      } catch {
+        return prompt;
+      }
+    }
+
+    return prompt;
+  });
+}
 
 async function convertSchemasToJsonSchemas(tasks: TaskManifest[]): Promise<TaskManifest[]> {
   const convertedTasks = tasks.map((task) => {

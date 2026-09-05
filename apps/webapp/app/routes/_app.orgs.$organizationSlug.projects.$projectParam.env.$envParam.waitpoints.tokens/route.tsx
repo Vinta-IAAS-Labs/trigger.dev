@@ -1,5 +1,6 @@
 import { BookOpenIcon } from "@heroicons/react/20/solid";
-import { Outlet, useParams, type MetaFunction } from "@remix-run/react";
+import { Outlet, useParams } from "@remix-run/react";
+
 import { type LoaderFunctionArgs } from "@remix-run/server-runtime";
 import { typedjson, useTypedLoaderData } from "remix-typedjson";
 import { AdminDebugTooltip } from "~/components/admin/debugTooltip";
@@ -13,9 +14,11 @@ import { DateTime } from "~/components/primitives/DateTime";
 import { NavBar, PageAccessories, PageTitle } from "~/components/primitives/PageHeader";
 import { Paragraph } from "~/components/primitives/Paragraph";
 import {
+  RESIZABLE_PANEL_ANIMATION,
   ResizableHandle,
   ResizablePanel,
   ResizablePanelGroup,
+  collapsibleHandleClassName,
 } from "~/components/primitives/Resizable";
 import {
   Table,
@@ -32,7 +35,6 @@ import {
   WaitpointSearchParamsSchema,
   WaitpointTokenFilters,
 } from "~/components/runs/v3/WaitpointTokenFilters";
-import { V4Title } from "~/components/V4Badge";
 import { useEnvironment } from "~/hooks/useEnvironment";
 import { useOrganization } from "~/hooks/useOrganizations";
 import { useProject } from "~/hooks/useProject";
@@ -40,15 +42,24 @@ import { findProjectBySlug } from "~/models/project.server";
 import { findEnvironmentBySlug } from "~/models/runtimeEnvironment.server";
 import { WaitpointListPresenter } from "~/presenters/v3/WaitpointListPresenter.server";
 import { requireUserId } from "~/services/session.server";
+import {
+  runOpsNewReplicaClient,
+  runOpsLegacyReplica,
+  runOpsSplitReadEnabled,
+  type PrismaClientOrTransaction,
+} from "~/db.server";
 import { docsPath, EnvironmentParamSchema, v3WaitpointTokenPath } from "~/utils/pathBuilder";
+import { waitpointsAgentPageContext } from "~/components/dashboard-agent/suggested-prompts";
+import { WhenAgentUnavailable } from "~/components/dashboard-agent/WhenAgentUnavailable";
+import type { Handle } from "~/utils/handle";
 
-export const meta: MetaFunction = () => {
-  return [
-    {
-      title: `Waitpoint tokens | Trigger.dev`,
-    },
-  ];
+export const handle: Handle = {
+  agentPageContext: (data) => waitpointsAgentPageContext(data),
 };
+
+import { pageMeta } from "~/utils/pageTitle";
+
+export const meta = pageMeta("Waitpoint tokens");
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const userId = await requireUserId(request);
@@ -86,7 +97,11 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   }
 
   try {
-    const presenter = new WaitpointListPresenter();
+    const presenter = new WaitpointListPresenter(undefined, undefined, {
+      runOpsNew: runOpsNewReplicaClient as unknown as PrismaClientOrTransaction,
+      runOpsLegacyReplica: runOpsLegacyReplica as unknown as PrismaClientOrTransaction,
+      splitEnabled: runOpsSplitReadEnabled,
+    });
     const result = await presenter.call({
       environment,
       ...searchParams,
@@ -103,8 +118,14 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
 };
 
 export default function Page() {
-  const { success, tokens, pagination, hasFilters, hasAnyTokens, filters } =
-    useTypedLoaderData<typeof loader>();
+  const {
+    success: _success,
+    tokens,
+    pagination,
+    hasFilters,
+    hasAnyTokens,
+    filters,
+  } = useTypedLoaderData<typeof loader>();
 
   const organization = useOrganization();
   const project = useProject();
@@ -116,12 +137,14 @@ export default function Page() {
   return (
     <PageContainer>
       <NavBar>
-        <PageTitle title={<V4Title>Waitpoint Tokens</V4Title>} />
+        <PageTitle title="Waitpoint Tokens" />
         <PageAccessories>
           <AdminDebugTooltip />
-          <LinkButton variant={"docs/small"} LeadingIcon={BookOpenIcon} to={docsPath("/wait")}>
-            Waitpoints docs
-          </LinkButton>
+          <WhenAgentUnavailable>
+            <LinkButton variant={"docs/small"} LeadingIcon={BookOpenIcon} to={docsPath("/wait")}>
+              Waitpoints docs
+            </LinkButton>
+          </WhenAgentUnavailable>
         </PageAccessories>
       </NavBar>
       <PageBody scrollable={false}>
@@ -231,23 +254,28 @@ export default function Page() {
                       )}
                     </TableBody>
                   </Table>
-
-                  {(pagination.next || pagination.previous) && (
-                    <div className="flex justify-end border-t border-grid-dimmed px-2 py-3">
-                      <ListPagination list={{ pagination }} />
-                    </div>
-                  )}
                 </div>
               </div>
             </ResizablePanel>
-            {isShowingWaitpoint && (
-              <>
-                <ResizableHandle id="waitpoint-tokens-handle" />
-                <ResizablePanel id="waitpoint-tokens-inspector" min="100px" default="500px">
-                  <Outlet />
-                </ResizablePanel>
-              </>
-            )}
+            <ResizableHandle
+              id="waitpoint-tokens-handle"
+              className={collapsibleHandleClassName(isShowingWaitpoint)}
+            />
+            <ResizablePanel
+              id="waitpoint-tokens-inspector"
+              min="450px"
+              default="500px"
+              className="overflow-hidden"
+              collapsible
+              collapsed={!isShowingWaitpoint}
+              onCollapseChange={() => {}}
+              collapsedSize="0px"
+              collapseAnimation={RESIZABLE_PANEL_ANIMATION}
+            >
+              <div className="h-full" style={{ minWidth: 450 }}>
+                <Outlet />
+              </div>
+            </ResizablePanel>
           </ResizablePanelGroup>
         )}
       </PageBody>

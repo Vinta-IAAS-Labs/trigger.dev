@@ -1,5 +1,5 @@
 import { type LoaderFunctionArgs, redirect } from "@remix-run/server-runtime";
-import { type MetaFunction, useFetcher, useNavigation, useLocation, Form } from "@remix-run/react";
+import { useFetcher, useNavigation, useLocation, useNavigate, Form } from "@remix-run/react";
 import { XMarkIcon } from "@heroicons/react/20/solid";
 import { ServiceValidationError } from "~/v3/services/baseService.server";
 import {
@@ -13,10 +13,11 @@ import { getCurrentPlan } from "~/services/platform.v3.server";
 import { EnvironmentParamSchema } from "~/utils/pathBuilder";
 import { findProjectBySlug } from "~/models/project.server";
 import { findEnvironmentBySlug } from "~/models/runtimeEnvironment.server";
-import { LogsListPresenter, LogEntry } from "~/presenters/v3/LogsListPresenter.server";
+import type { LogEntry } from "~/presenters/v3/LogsListPresenter.server";
+import { LogsListPresenter } from "~/presenters/v3/LogsListPresenter.server";
 import type { LogLevel } from "~/utils/logUtils";
-import { $replica, prisma } from "~/db.server";
-import { logsClickhouseClient } from "~/services/clickhouseInstance.server";
+import { $replica } from "~/db.server";
+import { clickhouseFactory } from "~/services/clickhouse/clickhouseFactoryInstance.server";
 import { NavBar, PageTitle } from "~/components/primitives/PageHeader";
 import { PageBody, PageContainer } from "~/components/layout/AppLayout";
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState, useTransition } from "react";
@@ -26,21 +27,33 @@ import { Paragraph } from "~/components/primitives/Paragraph";
 import { Callout } from "~/components/primitives/Callout";
 import { LogsTable } from "~/components/logs/LogsTable";
 import { LogDetailView } from "~/components/logs/LogDetailView";
-import { LogsSearchInput } from "~/components/logs/LogsSearchInput";
+import { SearchInput } from "~/components/primitives/SearchInput";
 import { LogsLevelFilter } from "~/components/logs/LogsLevelFilter";
 import { LogsTaskFilter } from "~/components/logs/LogsTaskFilter";
 import { LogsRunIdFilter } from "~/components/logs/LogsRunIdFilter";
 import { TimeFilter } from "~/components/runs/v3/SharedFilters";
 import {
+  RESIZABLE_PANEL_ANIMATION,
   ResizableHandle,
   ResizablePanel,
   ResizablePanelGroup,
+  collapsibleHandleClassName,
+  useFrozenValue,
 } from "~/components/primitives/Resizable";
 import { Button } from "~/components/primitives/Buttons";
-import { FEATURE_FLAG, validateFeatureFlagValue } from "~/v3/featureFlags.server";
+import { sectionAgentPageContext } from "~/components/dashboard-agent/suggested-prompts";
+import type { Handle } from "~/utils/handle";
+import { pageMeta } from "~/utils/pageTitle";
+import { hasLogsPageAccess } from "~/services/logsAccess.server";
+import { MIN_LOGS_SEARCH_LENGTH, normalizeLogsSearchTerm } from "~/utils/logSearch";
 
 // Valid log levels for filtering
 const validLevels: LogLevel[] = ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"];
+
+function formatSearchPeriod(period: string): string {
+  const days = Number(period.replace("d", ""));
+  return days === 1 ? "day" : `${days} days`;
+}
 
 function parseLevelsFromUrl(url: URL): LogLevel[] | undefined {
   const levelParams = url.searchParams.getAll("levels").filter((v) => v.length > 0);
@@ -48,48 +61,11 @@ function parseLevelsFromUrl(url: URL): LogLevel[] | undefined {
   return levelParams.filter((l): l is LogLevel => validLevels.includes(l as LogLevel));
 }
 
-export const meta: MetaFunction = () => {
-  return [
-    {
-      title: `Logs | Trigger.dev`,
-    },
-  ];
+export const handle: Handle = {
+  agentPageContext: () => sectionAgentPageContext("logs"),
 };
 
-// TODO: Move this to a more appropriate shared location
-async function hasLogsPageAccess(
-  userId: string,
-  isAdmin: boolean,
-  isImpersonating: boolean,
-  organizationSlug: string
-): Promise<boolean> {
-  if (isAdmin || isImpersonating) {
-    return true;
-  }
-
-  // Check organization feature flags
-  const organization = await prisma.organization.findFirst({
-    where: {
-      slug: organizationSlug,
-      members: { some: { userId } },
-    },
-    select: {
-      featureFlags: true,
-    },
-  });
-
-  if (!organization?.featureFlags) {
-    return false;
-  }
-
-  const flags = organization.featureFlags as Record<string, unknown>;
-  const hasLogsPageAccessResult = validateFeatureFlagValue(
-    FEATURE_FLAG.hasLogsPageAccess,
-    flags.hasLogsPageAccess
-  );
-
-  return hasLogsPageAccessResult.success && hasLogsPageAccessResult.data === true;
-}
+export const meta = pageMeta("Logs");
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const user = await requireUser(request);
@@ -134,7 +110,11 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const plan = await getCurrentPlan(project.organizationId);
   const retentionLimitDays = plan?.v3Subscription?.plan?.limits.logRetentionDays.number ?? 30;
 
-  const presenter = new LogsListPresenter($replica, logsClickhouseClient);
+  const logsClickhouse = await clickhouseFactory.getClickhouseForOrganization(
+    project.organizationId,
+    "logs"
+  );
+  const presenter = new LogsListPresenter($replica, logsClickhouse);
 
   const listPromise = presenter
     .call(project.organizationId, environment.id, {
@@ -147,8 +127,8 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       period,
       from,
       to,
-      defaultPeriod: "1h",
-      retentionLimitDays
+      defaultPeriod: "1d",
+      retentionLimitDays,
     })
     .catch((error) => {
       if (error instanceof ServiceValidationError) {
@@ -159,14 +139,13 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
 
   return typeddefer({
     data: listPromise,
-    defaultPeriod: "1h",
+    defaultPeriod: "1d",
     retentionLimitDays,
   });
 };
 
 export default function Page() {
-  const { data, defaultPeriod, retentionLimitDays } =
-    useTypedLoaderData<typeof loader>();
+  const { data, defaultPeriod, retentionLimitDays } = useTypedLoaderData<typeof loader>();
 
   return (
     <PageContainer>
@@ -192,10 +171,7 @@ export default function Page() {
             resolve={data}
             errorElement={
               <div className="grid h-full max-h-full grid-rows-[2.5rem_auto_1fr] overflow-hidden">
-                <FiltersBar
-                  defaultPeriod={defaultPeriod}
-                  retentionLimitDays={retentionLimitDays}
-                />
+                <FiltersBar defaultPeriod={defaultPeriod} retentionLimitDays={retentionLimitDays} />
                 <div className="flex items-center justify-center px-3 py-12">
                   <Callout variant="error" className="max-w-fit">
                     Unable to load your logs. Please refresh the page or try again in a moment.
@@ -228,10 +204,7 @@ export default function Page() {
                     defaultPeriod={defaultPeriod}
                     retentionLimitDays={retentionLimitDays}
                   />
-                  <LogsList
-                    list={result}
-                    defaultPeriod={defaultPeriod}
-                  />
+                  <LogsList list={result} defaultPeriod={defaultPeriod} />
                 </div>
               );
             }}
@@ -264,20 +237,25 @@ function FiltersBar({
 
   return (
     <div className="flex items-start justify-between gap-x-2 border-b border-grid-bright p-2">
-      <div className="flex flex-row flex-wrap items-center gap-1">
+      <div className="flex flex-row flex-wrap items-center gap-1.5">
         {list ? (
           <>
+            <SearchInput
+              minLength={MIN_LOGS_SEARCH_LENGTH}
+              normalizeForValidation={normalizeLogsSearchTerm}
+            />
             <LogsTaskFilter possibleTasks={list.possibleTasks} />
             <LogsRunIdFilter />
             <TimeFilter defaultPeriod={defaultPeriod} maxPeriodDays={retentionLimitDays} />
             <LogsLevelFilter />
-            <LogsSearchInput />
             {hasFilters && (
-              <Form className="h-6">
+              <Form className="-ml-1 h-6">
                 <Button
-                  variant="secondary/small"
+                  variant="minimal/small"
                   LeadingIcon={XMarkIcon}
                   tooltip="Clear all filters"
+                  className="group-hover/button:bg-transparent"
+                  leadingIconClassName="group-hover/button:text-text-bright"
                 />
               </Form>
             )}
@@ -288,13 +266,18 @@ function FiltersBar({
             <LogsRunIdFilter />
             <TimeFilter defaultPeriod={defaultPeriod} maxPeriodDays={retentionLimitDays} />
             <LogsLevelFilter />
-            <LogsSearchInput />
+            <SearchInput
+              minLength={MIN_LOGS_SEARCH_LENGTH}
+              normalizeForValidation={normalizeLogsSearchTerm}
+            />
             {hasFilters && (
-              <Form className="h-6">
+              <Form className="-ml-1 h-6">
                 <Button
-                  variant="secondary/small"
+                  variant="minimal/small"
                   LeadingIcon={XMarkIcon}
                   tooltip="Clear all filters"
+                  className="group-hover/button:bg-transparent"
+                  leadingIconClassName="group-hover/button:text-text-bright"
                 />
               </Form>
             )}
@@ -312,6 +295,7 @@ function LogsList({
   defaultPeriod?: string;
 }) {
   const navigation = useNavigation();
+  const navigate = useNavigate();
   const location = useLocation();
   const fetcher = useFetcher<{ logs: LogEntry[]; pagination: { next?: string } }>();
   const [, startTransition] = useTransition();
@@ -334,6 +318,7 @@ function LogsList({
 
   // Clear accumulated logs immediately when filters change (for instant visual feedback)
   useEffect(() => {
+    // oxlint-disable-next-line react/set-state-in-effect -- This effect intentionally synchronizes route state after an external or lifecycle change.
     setAccumulatedLogs([]);
     setNextCursor(undefined);
     // Preserve log selection from URL param, clear if not present
@@ -343,6 +328,7 @@ function LogsList({
 
   // Populate accumulated logs when new data arrives
   useEffect(() => {
+    // oxlint-disable-next-line react/set-state-in-effect -- This effect intentionally synchronizes route state after an external or lifecycle change.
     setAccumulatedLogs(list.logs);
     setNextCursor(list.pagination.next);
   }, [list.logs, list.pagination.next]);
@@ -409,6 +395,11 @@ function LogsList({
     return accumulatedLogs.find((log) => log.id === selectedLogId);
   }, [selectedLogId, accumulatedLogs]);
 
+  const frozenLogId = useFrozenValue(selectedLogId);
+  const frozenLog = useFrozenValue(selectedLog);
+  const displayLogId = selectedLogId ?? frozenLogId;
+  const displayLog = selectedLog ?? frozenLog ?? undefined;
+
   const updateUrlWithLog = useCallback((logId: string | undefined) => {
     const url = new URL(window.location.href);
     if (logId) {
@@ -448,44 +439,77 @@ function LogsList({
     fetcher.load(`${resourcePath}?${params.toString()}`);
   }, [fetcher, location.pathname, location.search]);
 
+  const expandSearch = useCallback(() => {
+    const url = new URL(window.location.href);
+    url.searchParams.set("period", list.searchExpansion?.nextPeriod ?? "7d");
+    url.searchParams.delete("cursor");
+    url.searchParams.delete("log");
+    navigate(`${url.pathname}?${url.searchParams.toString()}`);
+  }, [list.searchExpansion?.nextPeriod, navigate]);
+
   return (
-    <ResizablePanelGroup orientation="horizontal" className="max-h-full">
-      <ResizablePanel id="logs-main" min="200px">
-        <LogsTable
-          key={location.search}
-          logs={accumulatedLogs}
-          searchTerm={list.searchTerm}
-          isLoading={isLoading}
-          isLoadingMore={fetcher.state === "loading"}
-          hasMore={!!nextCursor}
-          onLoadMore={handleLoadMore}
-          onCheckForMore={handleCheckForMore}
-          selectedLogId={selectedLogId}
-          onLogSelect={handleLogSelect}
-        />
-      </ResizablePanel>
-      {/* Side panel for log details */}
-      {selectedLogId && (
-        <>
-          <ResizableHandle id="logs-handle" />
-          <ResizablePanel id="log-detail" min="300px" default="430px" max="600px" isStaticAtRest>
-            <Suspense
-              fallback={
-                <div className="flex h-full items-center justify-center">
-                  <Spinner />
-                </div>
-              }
-            >
-              <LogDetailView
-                logId={selectedLogId}
-                initialLog={selectedLog}
-                onClose={handleClosePanel}
-                searchTerm={list.searchTerm}
-              />
-            </Suspense>
-          </ResizablePanel>
-        </>
+    <div className="flex min-h-0 flex-1 flex-col">
+      {list.searchExpansion && (
+        <Callout
+          variant="info"
+          className="m-2 mb-0"
+          cta={
+            <Button variant="tertiary/small" onClick={expandSearch}>
+              Search last {formatSearchPeriod(list.searchExpansion.nextPeriod)}
+            </Button>
+          }
+        >
+          No matches in the last day.
+        </Callout>
       )}
-    </ResizablePanelGroup>
+      <ResizablePanelGroup orientation="horizontal" className="min-h-0 flex-1">
+        <ResizablePanel id="logs-main" min="200px">
+          <LogsTable
+            key={location.search}
+            logs={accumulatedLogs}
+            searchTerm={list.searchTerm}
+            isLoading={isLoading}
+            isLoadingMore={fetcher.state === "loading"}
+            hasMore={!!nextCursor}
+            onLoadMore={handleLoadMore}
+            onCheckForMore={handleCheckForMore}
+            selectedLogId={selectedLogId}
+            onLogSelect={handleLogSelect}
+          />
+        </ResizablePanel>
+        <ResizableHandle id="logs-handle" className={collapsibleHandleClassName(!!selectedLogId)} />
+        <ResizablePanel
+          id="log-detail"
+          default="430px"
+          min="430px"
+          max="600px"
+          className="overflow-hidden"
+          collapsible
+          collapsed={!selectedLogId}
+          onCollapseChange={() => {}}
+          collapsedSize="0px"
+          collapseAnimation={RESIZABLE_PANEL_ANIMATION}
+        >
+          <div className="h-full" style={{ minWidth: 430 }}>
+            {displayLogId && (
+              <Suspense
+                fallback={
+                  <div className="flex h-full items-center justify-center">
+                    <Spinner />
+                  </div>
+                }
+              >
+                <LogDetailView
+                  logId={displayLogId}
+                  initialLog={displayLog}
+                  onClose={handleClosePanel}
+                  searchTerm={list.searchTerm}
+                />
+              </Suspense>
+            )}
+          </div>
+        </ResizablePanel>
+      </ResizablePanelGroup>
+    </div>
   );
 }

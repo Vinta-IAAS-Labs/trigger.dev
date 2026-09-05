@@ -1,14 +1,14 @@
-import { createRedisClient, Redis, type RedisOptions } from "@internal/redis";
+import { type Redis, createRedisClient, type RedisOptions } from "@internal/redis";
 import {
-  Attributes,
-  Histogram,
-  Meter,
+  type Attributes,
+  type Histogram,
+  type Meter,
+  type ObservableResult,
+  type Tracer,
   metrics,
-  ObservableResult,
   SpanKind,
   startSpan,
   trace,
-  Tracer,
   ValueType,
 } from "@internal/tracing";
 import { Logger } from "@trigger.dev/core/logger";
@@ -18,8 +18,8 @@ import { shutdownManager } from "@trigger.dev/core/v3/serverOnly";
 import { nanoid } from "nanoid";
 import pLimit from "p-limit";
 import { z } from "zod";
-import { AnyQueueItem, SimpleQueue } from "./queue.js";
-import { parseExpression } from "cron-parser";
+import { type AnyQueueItem, SimpleQueue } from "./queue.js";
+import cronParser from "cron-parser";
 
 export const CronSchema = z.object({
   cron: z.string(),
@@ -66,10 +66,11 @@ export type JobHandler<Catalog extends WorkerCatalog, K extends keyof Catalog> =
   params: JobHandlerParams<Catalog, K>
 ) => Promise<void>;
 
-type JobHandlerFor<Catalog extends WorkerCatalog, K extends keyof Catalog> =
-  Catalog[K] extends { batch: BatchConfig }
-    ? (items: Array<JobHandlerParams<Catalog, K>>) => Promise<void>
-    : (params: JobHandlerParams<Catalog, K>) => Promise<void>;
+type JobHandlerFor<Catalog extends WorkerCatalog, K extends keyof Catalog> = Catalog[K] extends {
+  batch: BatchConfig;
+}
+  ? (items: Array<JobHandlerParams<Catalog, K>>) => Promise<void>
+  : (params: JobHandlerParams<Catalog, K>) => Promise<void>;
 
 export type WorkerConcurrencyOptions = {
   workers?: number;
@@ -139,7 +140,7 @@ class Worker<TCatalog extends WorkerCatalog> {
   > = new Map();
 
   constructor(private options: WorkerOptions<TCatalog>) {
-    this.logger = options.logger ?? new Logger("Worker", "debug");
+    this.logger = options.logger ?? new Logger("Worker", "debug", ["item"]);
     this.tracer = options.tracer ?? trace.getTracer(options.name);
     this.meter = options.meter ?? metrics.getMeter(options.name);
 
@@ -205,6 +206,17 @@ class Worker<TCatalog extends WorkerCatalog> {
     concurrencyLimitPendingObservableGauge.addCallback(
       this.#updateConcurrencyLimitPendingMetric.bind(this)
     );
+
+    const oldestMessageAgeObservableGauge = this.meter.createObservableGauge(
+      "redis_worker.queue.oldest_message_age",
+      {
+        description: "Age of the oldest overdue message in the queue",
+        unit: "ms",
+        valueType: ValueType.INT,
+      }
+    );
+
+    oldestMessageAgeObservableGauge.addCallback(this.#updateOldestMessageAgeMetric.bind(this));
   }
 
   async #updateQueueSizeMetric(observableResult: ObservableResult<Attributes>) {
@@ -218,6 +230,14 @@ class Worker<TCatalog extends WorkerCatalog> {
   async #updateDeadLetterQueueSizeMetric(observableResult: ObservableResult<Attributes>) {
     const deadLetterQueueSize = await this.queue.sizeOfDeadLetterQueue();
     observableResult.observe(deadLetterQueueSize, {
+      worker_name: this.options.name,
+    });
+  }
+
+  async #updateOldestMessageAgeMetric(observableResult: ObservableResult<Attributes>) {
+    const oldestMessageAge = await this.queue.oldestMessageAge();
+
+    observableResult.observe(oldestMessageAge, {
       worker_name: this.options.name,
     });
   }
@@ -583,15 +603,16 @@ class Worker<TCatalog extends WorkerCatalog> {
               await this.flushBatch(queueItem.job, workerId, limiter);
             }
           } else {
-            limiter(() =>
-              this.processItem(queueItem, items.length, workerId, limiter)
-            ).catch((err) => {
-              this.logger.error("Unhandled error in processItem:", {
-                error: err,
-                workerId,
-                item,
-              });
-            });
+            limiter(() => this.processItem(queueItem, items.length, workerId, limiter)).catch(
+              (err) => {
+                this.logger.error("Unhandled error in processItem:", {
+                  error: err,
+                  workerId,
+                  id: queueItem.id,
+                  job: queueItem.job,
+                });
+              }
+            );
           }
         }
       } catch (error) {
@@ -745,23 +766,25 @@ class Worker<TCatalog extends WorkerCatalog> {
     ).catch(async (error) => {
       const errorMessage = error instanceof Error ? error.message : String(error);
       const shouldLogError = catalogItem.logErrors ?? true;
+      const errorLogLevel =
+        error && typeof error === "object" && "logLevel" in error ? error.logLevel : undefined;
 
-      if (shouldLogError) {
-        this.logger.error(`Worker error processing batch`, {
-          name: this.options.name,
-          jobType,
-          batchSize: items.length,
-          error,
-          errorMessage,
-        });
+      const logAttributes = {
+        name: this.options.name,
+        jobType,
+        batchSize: items.length,
+        error,
+        errorMessage,
+      };
+
+      if (!shouldLogError) {
+        this.logger.info(`Worker failed to process batch`, logAttributes);
+      } else if (errorLogLevel === "warn") {
+        this.logger.warn(`Worker error processing batch`, logAttributes);
+      } else if (errorLogLevel === "info") {
+        this.logger.info(`Worker error processing batch`, logAttributes);
       } else {
-        this.logger.info(`Worker failed to process batch`, {
-          name: this.options.name,
-          jobType,
-          batchSize: items.length,
-          error,
-          errorMessage,
-        });
+        this.logger.error(`Worker error processing batch`, logAttributes);
       }
 
       // Re-enqueue each item individually with retry logic
@@ -775,20 +798,33 @@ class Worker<TCatalog extends WorkerCatalog> {
           const retryDelay = calculateNextRetryDelay(retrySettings, newAttempt);
 
           if (!retryDelay) {
-            if (shouldLogError) {
-              this.logger.error(`Worker batch item reached max attempts. Moving to DLQ.`, {
-                name: this.options.name,
-                id: item.id,
-                jobType,
-                attempt: newAttempt,
-              });
+            const dlqLogAttributes = {
+              name: this.options.name,
+              id: item.id,
+              jobType,
+              attempt: newAttempt,
+            };
+
+            if (!shouldLogError) {
+              this.logger.info(
+                `Worker batch item reached max attempts. Moving to DLQ.`,
+                dlqLogAttributes
+              );
+            } else if (errorLogLevel === "warn") {
+              this.logger.warn(
+                `Worker batch item reached max attempts. Moving to DLQ.`,
+                dlqLogAttributes
+              );
+            } else if (errorLogLevel === "info") {
+              this.logger.info(
+                `Worker batch item reached max attempts. Moving to DLQ.`,
+                dlqLogAttributes
+              );
             } else {
-              this.logger.info(`Worker batch item reached max attempts. Moving to DLQ.`, {
-                name: this.options.name,
-                id: item.id,
-                jobType,
-                attempt: newAttempt,
-              });
+              this.logger.error(
+                `Worker batch item reached max attempts. Moving to DLQ.`,
+                dlqLogAttributes
+              );
             }
 
             await this.queue.moveToDeadLetterQueue(item.id, errorMessage);
@@ -895,21 +931,28 @@ class Worker<TCatalog extends WorkerCatalog> {
       const errorMessage = error instanceof Error ? error.message : String(error);
 
       const shouldLogError = catalogItem.logErrors ?? true;
+      const errorLogLevel =
+        error && typeof error === "object" && "logLevel" in error ? error.logLevel : undefined;
 
+      // Never include the raw item/payload here: it is job data that may be
+      // customer-controlled. It is retrievable via `getJob(id)` if needed for triage.
       const logAttributes = {
         name: this.options.name,
         id,
         job,
-        item,
         visibilityTimeoutMs,
         error,
         errorMessage,
       };
 
-      if (shouldLogError) {
-        this.logger.error(`Worker error processing item`, logAttributes);
-      } else {
+      if (!shouldLogError) {
         this.logger.info(`Worker failed to process item`, logAttributes);
+      } else if (errorLogLevel === "warn") {
+        this.logger.warn(`Worker error processing item`, logAttributes);
+      } else if (errorLogLevel === "info") {
+        this.logger.info(`Worker error processing item`, logAttributes);
+      } else {
+        this.logger.error(`Worker error processing item`, logAttributes);
       }
 
       // Attempt requeue logic.
@@ -922,13 +965,18 @@ class Worker<TCatalog extends WorkerCatalog> {
         const retryDelay = calculateNextRetryDelay(retrySettings, newAttempt);
 
         if (!retryDelay) {
-          if (shouldLogError) {
-            this.logger.error(`Worker item reached max attempts. Moving to DLQ.`, {
+          if (!shouldLogError || errorLogLevel === "info") {
+            this.logger.info(`Worker item reached max attempts. Moving to DLQ.`, {
+              ...logAttributes,
+              attempt: newAttempt,
+            });
+          } else if (errorLogLevel === "warn") {
+            this.logger.warn(`Worker item reached max attempts. Moving to DLQ.`, {
               ...logAttributes,
               attempt: newAttempt,
             });
           } else {
-            this.logger.info(`Worker item reached max attempts. Moving to DLQ.`, {
+            this.logger.error(`Worker item reached max attempts. Moving to DLQ.`, {
               ...logAttributes,
               attempt: newAttempt,
             });
@@ -948,7 +996,6 @@ class Worker<TCatalog extends WorkerCatalog> {
           name: this.options.name,
           id,
           job,
-          item,
           retryDate,
           retryDelay,
           visibilityTimeoutMs,
@@ -969,7 +1016,6 @@ class Worker<TCatalog extends WorkerCatalog> {
             name: this.options.name,
             id,
             job,
-            item,
             visibilityTimeoutMs,
             error: requeueError,
           }
@@ -1024,7 +1070,7 @@ class Worker<TCatalog extends WorkerCatalog> {
     Promise.allSettled(enqueuePromises).then((results) => {
       results.forEach((result) => {
         if (result.status === "fulfilled") {
-          this.logger.info("Enqueued cron job", { result: result.value });
+          this.logger.debug("Enqueued cron job", { result: result.value });
         } else {
           this.logger.error("Failed to enqueue cron job", { reason: result.reason });
         }
@@ -1050,7 +1096,7 @@ class Worker<TCatalog extends WorkerCatalog> {
       availableAt,
     });
 
-    this.logger.info("Enqueued cron job", {
+    this.logger.debug("Enqueued cron job", {
       identifier,
       cron,
       job,
@@ -1084,9 +1130,10 @@ class Worker<TCatalog extends WorkerCatalog> {
   }
 
   private calculateNextScheduledAt(cron: string, lastTimestamp?: Date): Date {
-    const scheduledAt = parseExpression(cron, {
-      currentDate: lastTimestamp,
-    })
+    const scheduledAt = cronParser
+      .parseExpression(cron, {
+        currentDate: lastTimestamp,
+      })
       .next()
       .toDate();
 
@@ -1151,16 +1198,26 @@ class Worker<TCatalog extends WorkerCatalog> {
     this.isShuttingDown = true;
     this.logger.log("Shutting down worker loops...", { signal });
 
-    // Wait for all worker loops to finish.
-    await Promise.race([
-      Promise.all(this.workerLoops),
-      Worker.delay(this.shutdownTimeoutMs).then(() => {
+    // Wait for all worker loops to finish, retaining ownership of the deadline timer so the
+    // losing timeout cannot keep the process alive after a prompt shutdown.
+    let shutdownDeadline: ReturnType<typeof setTimeout> | undefined;
+    const deadlinePromise = new Promise<void>((resolve) => {
+      shutdownDeadline = setTimeout(() => {
         this.logger.error("Worker shutdown timed out", {
           signal,
           shutdownTimeoutMs: this.shutdownTimeoutMs,
         });
-      }),
-    ]);
+        resolve();
+      }, this.shutdownTimeoutMs);
+    });
+
+    try {
+      await Promise.race([Promise.all(this.workerLoops), deadlinePromise]);
+    } finally {
+      if (shutdownDeadline) {
+        clearTimeout(shutdownDeadline);
+      }
+    }
 
     await this.subscriber?.unsubscribe();
     await this.subscriber?.quit();

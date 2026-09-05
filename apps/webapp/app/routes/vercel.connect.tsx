@@ -23,7 +23,7 @@ async function createOrFindVercelIntegration(
   projectId: string,
   tokenResponse: TokenResponse,
   configurationId: string | undefined,
-  origin: 'marketplace' | 'dashboard'
+  origin: "marketplace" | "dashboard"
 ): Promise<void> {
   const project = await prisma.project.findUnique({
     where: { id: projectId },
@@ -47,7 +47,7 @@ async function createOrFindVercelIntegration(
       teamId: tokenResponse.teamId ?? null,
       userId: tokenResponse.userId,
       installationId: configurationId,
-      raw: tokenResponse.raw
+      raw: tokenResponse.raw,
     });
   } else {
     await VercelIntegrationRepository.createVercelOrgIntegration({
@@ -69,7 +69,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
 
   const parsed = VercelConnectSchema.safeParse(Object.fromEntries(url.searchParams));
   if (!parsed.success) {
-    logger.error("Invalid Vercel connect params", { error: parsed.error });
+    logger.warn("Invalid Vercel connect params", { error: parsed.error });
     throw new Response("Invalid parameters", { status: 400 });
   }
 
@@ -77,7 +77,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
 
   const validationResult = await validateVercelOAuthState(state);
   if (!validationResult.ok) {
-    logger.error("Invalid Vercel OAuth state JWT", { error: validationResult.error });
+    logger.warn("Invalid Vercel OAuth state JWT", { error: validationResult.error });
 
     if (
       validationResult.error?.includes("expired") ||
@@ -109,7 +109,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
   });
 
   if (!project) {
-    logger.error("Project not found or access denied", {
+    logger.warn("Project not found or access denied", {
       projectId: stateData.projectId,
       userId,
     });
@@ -132,7 +132,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
   });
 
   if (!environment) {
-    logger.error("Environment not found", {
+    logger.warn("Environment not found", {
       projectId: project.id,
       environmentSlug: stateData.environmentSlug,
     });
@@ -146,7 +146,13 @@ export async function loader({ request }: LoaderFunctionArgs) {
   );
 
   const result = await fromPromise(
-    createOrFindVercelIntegration(stateData.organizationId, stateData.projectId, tokenResponse, configurationId, origin),
+    createOrFindVercelIntegration(
+      stateData.organizationId,
+      stateData.projectId,
+      tokenResponse,
+      configurationId,
+      origin
+    ),
     (error) => error
   );
 

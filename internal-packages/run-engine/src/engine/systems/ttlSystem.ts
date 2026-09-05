@@ -1,31 +1,50 @@
 import { parseNaturalLanguageDuration } from "@trigger.dev/core/v3/isomorphic";
-import { TaskRunError } from "@trigger.dev/core/v3/schemas";
-import { Prisma, PrismaClientOrTransaction, TaskRunStatus } from "@trigger.dev/database";
+import type { TaskRunError } from "@trigger.dev/core/v3/schemas";
+import type { PrismaClientOrTransaction, TaskRunStatus } from "@trigger.dev/database";
 import { isExecuting } from "../statuses.js";
 import { getLatestExecutionSnapshot } from "./executionSnapshotSystem.js";
-import { SystemResources } from "./systems.js";
-import { WaitpointSystem } from "./waitpointSystem.js";
+import type { SystemResources } from "./systems.js";
+import type { WaitpointSystem } from "./waitpointSystem.js";
 import { startSpan } from "@internal/tracing";
 import pMap from "p-map";
 
+import { boundedIn } from "@trigger.dev/database";
 export type TtlSystemOptions = {
   resources: SystemResources;
   waitpointSystem: WaitpointSystem;
+  finalizationGuardDelayMs?: number;
 };
 
 export class TtlSystem {
   private readonly $: SystemResources;
   private readonly waitpointSystem: WaitpointSystem;
+  private readonly finalizationGuardDelayMs: number;
 
   constructor(private readonly options: TtlSystemOptions) {
     this.$ = options.resources;
     this.waitpointSystem = options.waitpointSystem;
+    this.finalizationGuardDelayMs = options.finalizationGuardDelayMs ?? 60_000;
+  }
+
+  /**
+   * Write-ahead guard for TTL expiry, mirroring the run attempt system's: enqueued
+   * before the EXPIRED commit so a crash or error between that commit and the
+   * waitpoint completion cannot strand a waiting parent, and acked once the inline
+   * side effects succeed.
+   */
+  async #scheduleFinalizationGuard(runId: string): Promise<void> {
+    await this.$.worker.enqueue({
+      id: `ensureRunFinalized:${runId}`,
+      job: "ensureRunFinalized",
+      payload: { runId },
+      availableAt: new Date(Date.now() + this.finalizationGuardDelayMs),
+    });
   }
 
   async expireRun({ runId, tx }: { runId: string; tx?: PrismaClientOrTransaction }) {
     const prisma = tx ?? this.$.prisma;
     await this.$.runLock.lock("expireRun", [runId], async () => {
-      const snapshot = await getLatestExecutionSnapshot(prisma, runId);
+      const snapshot = await getLatestExecutionSnapshot(prisma, runId, this.$.runStore);
 
       //if we're executing then we won't expire the run
       if (isExecuting(snapshot.executionStatus)) {
@@ -33,7 +52,7 @@ export class TtlSystem {
       }
 
       //only expire "PENDING" runs
-      const run = await prisma.taskRun.findFirst({ where: { id: runId } });
+      const run = await this.$.runStore.findRun({ id: runId }, prisma);
 
       if (!run) {
         this.$.logger.debug("Could not find enqueued run to expire", {
@@ -61,59 +80,51 @@ export class TtlSystem {
         raw: `Run expired because the TTL (${run.ttl}) was reached`,
       };
 
-      const updatedRun = await prisma.taskRun.update({
-        where: { id: runId },
-        data: {
-          status: "EXPIRED",
-          completedAt: new Date(),
-          expiredAt: new Date(),
-          error,
-          executionSnapshots: {
-            create: {
-              engine: "V2",
-              executionStatus: "FINISHED",
-              description: "Run was expired because the TTL was reached",
-              runStatus: "EXPIRED",
-              environmentId: snapshot.environmentId,
-              environmentType: snapshot.environmentType,
-              projectId: snapshot.projectId,
-              organizationId: snapshot.organizationId,
-            },
-          },
-        },
-        select: {
-          id: true,
-          spanId: true,
-          ttl: true,
-          updatedAt: true,
-          associatedWaitpoint: {
-            select: {
-              id: true,
-            },
-          },
-          runtimeEnvironment: {
-            select: {
-              organizationId: true,
-              projectId: true,
-              id: true,
-            },
-          },
-          createdAt: true,
-          completedAt: true,
-          taskEventStore: true,
-          parentTaskRunId: true,
-          expiredAt: true,
-          status: true,
-        },
-      });
+      await this.#scheduleFinalizationGuard(runId);
 
-      await this.$.runQueue.acknowledgeMessage(
-        updatedRun.runtimeEnvironment.organizationId,
+      const updatedRun = await this.$.runStore.expireRun(
         runId,
         {
-          removeFromWorkerQueue: true,
-        }
+          error,
+          completedAt: new Date(),
+          expiredAt: new Date(),
+          snapshot: {
+            engine: "V2",
+            executionStatus: "FINISHED",
+            description: "Run was expired because the TTL was reached",
+            runStatus: "EXPIRED",
+            environmentId: snapshot.environmentId,
+            environmentType: snapshot.environmentType,
+            projectId: snapshot.projectId,
+            organizationId: snapshot.organizationId,
+          },
+        },
+        {
+          select: {
+            id: true,
+            runtimeEnvironmentId: true,
+            spanId: true,
+            ttl: true,
+            updatedAt: true,
+            associatedWaitpoint: {
+              select: {
+                id: true,
+              },
+            },
+            createdAt: true,
+            completedAt: true,
+            taskEventStore: true,
+            parentTaskRunId: true,
+            expiredAt: true,
+            status: true,
+          },
+        },
+        prisma
       );
+
+      await this.$.runQueue.acknowledgeMessage(snapshot.organizationId, runId, {
+        removeFromWorkerQueue: true,
+      });
 
       // Complete the waitpoint if it exists (runs without waiting parents have no waitpoint)
       if (updatedRun.associatedWaitpoint) {
@@ -126,10 +137,12 @@ export class TtlSystem {
       this.$.eventBus.emit("runExpired", {
         run: updatedRun,
         time: new Date(),
-        organization: { id: updatedRun.runtimeEnvironment.organizationId },
-        project: { id: updatedRun.runtimeEnvironment.projectId },
-        environment: { id: updatedRun.runtimeEnvironment.id },
+        organization: { id: snapshot.organizationId },
+        project: { id: snapshot.projectId },
+        environment: { id: snapshot.environmentId },
       });
+
+      await this.$.worker.ack(`ensureRunFinalized:${runId}`);
     });
   }
 
@@ -157,22 +170,20 @@ export class TtlSystem {
     expired: string[];
     skipped: { runId: string; reason: string }[];
   }> {
-    return startSpan(
-      this.$.tracer,
-      "TtlSystem.expireRunsBatch",
-      async (span) => {
-        span.setAttribute("runCount", runIds.length);
+    return startSpan(this.$.tracer, "TtlSystem.expireRunsBatch", async (span) => {
+      span.setAttribute("runCount", runIds.length);
 
-        if (runIds.length === 0) {
-          return { expired: [], skipped: [] };
-        }
+      if (runIds.length === 0) {
+        return { expired: [], skipped: [] };
+      }
 
-        const expired: string[] = [];
-        const skipped: { runId: string; reason: string }[] = [];
+      const expired: string[] = [];
+      const skipped: { runId: string; reason: string }[] = [];
 
-        // Fetch all runs in a single query (no snapshot data needed)
-        const runs = await this.$.readOnlyPrisma.taskRun.findMany({
-          where: { id: { in: runIds } },
+      // Fetch all runs in a single query (no snapshot data needed)
+      const runs = await this.$.runStore.findRuns(
+        {
+          where: { id: { in: boundedIn(runIds) } },
           select: {
             id: true,
             spanId: true,
@@ -186,115 +197,122 @@ export class TtlSystem {
             projectId: true,
             runtimeEnvironmentId: true,
           },
-        });
+          // read-your-writes: the queue slot is already claimed; a lagging replica would orphan the run
+        },
+        this.$.prisma
+      );
 
-        // Filter runs that can be expired
-        const runsToExpire: typeof runs = [];
+      // Filter runs that can be expired
+      const runsToExpire: typeof runs = [];
 
-        for (const run of runs) {
-          if (run.status !== "PENDING") {
-            skipped.push({ runId: run.id, reason: `status_${run.status}` });
-            continue;
-          }
-
-          if (run.lockedAt) {
-            skipped.push({ runId: run.id, reason: "locked" });
-            continue;
-          }
-
-          runsToExpire.push(run);
+      for (const run of runs) {
+        if (run.status !== "PENDING") {
+          skipped.push({ runId: run.id, reason: `status_${run.status}` });
+          continue;
         }
 
-        // Track runs that weren't found
-        const foundRunIds = new Set(runs.map((r) => r.id));
-        for (const runId of runIds) {
-          if (!foundRunIds.has(runId)) {
-            skipped.push({ runId, reason: "not_found" });
-          }
+        if (run.lockedAt) {
+          skipped.push({ runId: run.id, reason: "locked" });
+          continue;
         }
 
-        if (runsToExpire.length === 0) {
-          span.setAttribute("expiredCount", 0);
-          span.setAttribute("skippedCount", skipped.length);
-          return { expired, skipped };
+        runsToExpire.push(run);
+      }
+
+      // Track runs that weren't found
+      const foundRunIds = new Set(runs.map((r) => r.id));
+      for (const runId of runIds) {
+        if (!foundRunIds.has(runId)) {
+          skipped.push({ runId, reason: "not_found" });
         }
+      }
 
-        // Update all runs in a single SQL call (status, dates, and error JSON)
-        const now = new Date();
-        const runIdsToExpire = runsToExpire.map((r) => r.id);
-
-        const error: TaskRunError = {
-          type: "STRING_ERROR",
-          raw: "Run expired because the TTL was reached",
-        };
-
-        await this.$.prisma.$executeRaw`
-          UPDATE "TaskRun"
-          SET "status" = 'EXPIRED'::"TaskRunStatus",
-              "completedAt" = ${now},
-              "expiredAt" = ${now},
-              "updatedAt" = ${now},
-              "error" = ${JSON.stringify(error)}::jsonb
-          WHERE "id" IN (${Prisma.join(runIdsToExpire)})
-        `;
-
-        // Process each run: enqueue waitpoint completion jobs and emit events
-        await pMap(
-          runsToExpire,
-          async (run) => {
-            try {
-              // Enqueue a finishWaitpoint worker job for resilient waitpoint completion
-              if (run.associatedWaitpoint) {
-                await this.$.worker.enqueue({
-                  id: `finishWaitpoint.ttl.${run.associatedWaitpoint.id}`,
-                  job: "finishWaitpoint",
-                  payload: {
-                    waitpointId: run.associatedWaitpoint.id,
-                    error: JSON.stringify(error),
-                  },
-                });
-              }
-
-              // This should really never happen
-              if (!run.organizationId) {
-                return;
-              }
-
-              // Emit event
-              this.$.eventBus.emit("runExpired", {
-                run: {
-                  id: run.id,
-                  spanId: run.spanId,
-                  ttl: run.ttl,
-                  taskEventStore: run.taskEventStore,
-                  createdAt: run.createdAt,
-                  updatedAt: now,
-                  completedAt: now,
-                  expiredAt: now,
-                  status: "EXPIRED" as TaskRunStatus,
-                },
-                time: now,
-                organization: { id: run.organizationId },
-                project: { id: run.projectId },
-                environment: { id: run.runtimeEnvironmentId },
-              });
-
-              expired.push(run.id);
-            } catch (e) {
-              this.$.logger.error("Failed to process expired run", {
-                runId: run.id,
-                error: e,
-              });
-            }
-          },
-          { concurrency: 10, stopOnError: false }
-        );
-
-        span.setAttribute("expiredCount", expired.length);
+      if (runsToExpire.length === 0) {
+        span.setAttribute("expiredCount", 0);
         span.setAttribute("skippedCount", skipped.length);
-
         return { expired, skipped };
       }
-    );
+
+      // Update all runs in a single SQL call (status, dates, and error JSON)
+      const now = new Date();
+      const runIdsToExpire = runsToExpire.map((r) => r.id);
+
+      const error: TaskRunError = {
+        type: "STRING_ERROR",
+        raw: "Run expired because the TTL was reached",
+      };
+
+      await pMap(runsToExpire, (run) => this.#scheduleFinalizationGuard(run.id), {
+        concurrency: 10,
+      });
+
+      await this.$.runStore.expireRunsBatch(runIdsToExpire, { error, now }, this.$.prisma);
+
+      // Process each run: enqueue waitpoint completion jobs and emit events
+      await pMap(
+        runsToExpire,
+        async (run) => {
+          try {
+            // Enqueue a finishWaitpoint worker job for resilient waitpoint completion
+            if (run.associatedWaitpoint) {
+              await this.$.worker.enqueue({
+                id: `finishWaitpoint.ttl.${run.associatedWaitpoint.id}`,
+                job: "finishWaitpoint",
+                payload: {
+                  waitpointId: run.associatedWaitpoint.id,
+                  error: JSON.stringify(error),
+                },
+              });
+            }
+
+            // This should really never happen
+            if (!run.organizationId) {
+              return;
+            }
+
+            this.$.eventBus.emit("runExpired", {
+              run: {
+                id: run.id,
+                spanId: run.spanId,
+                ttl: run.ttl,
+                taskEventStore: run.taskEventStore,
+                createdAt: run.createdAt,
+                updatedAt: now,
+                completedAt: now,
+                expiredAt: now,
+                status: "EXPIRED" as TaskRunStatus,
+              },
+              time: now,
+              organization: { id: run.organizationId },
+              project: { id: run.projectId },
+              environment: { id: run.runtimeEnvironmentId },
+            });
+
+            /**
+             * Waitpoint completion in this path is delegated to the finishWaitpoint job,
+             * which can still exhaust its retries, so the guard stays armed for runs with
+             * a waiting parent and verifies the completion landed. Runs with no waitpoint
+             * have nothing left to re-deliver, so release their guard now.
+             */
+            if (!run.associatedWaitpoint) {
+              await this.$.worker.ack(`ensureRunFinalized:${run.id}`);
+            }
+
+            expired.push(run.id);
+          } catch (e) {
+            this.$.logger.error("Failed to process expired run", {
+              runId: run.id,
+              error: e,
+            });
+          }
+        },
+        { concurrency: 10, stopOnError: false }
+      );
+
+      span.setAttribute("expiredCount", expired.length);
+      span.setAttribute("skippedCount", skipped.length);
+
+      return { expired, skipped };
+    });
   }
 }

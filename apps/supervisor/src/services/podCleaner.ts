@@ -1,8 +1,9 @@
-import { SimpleStructuredLogger } from "@trigger.dev/core/v3/utils/structuredLogger";
-import { K8sApi } from "../clients/kubernetes.js";
-import { createK8sApi } from "../clients/kubernetes.js";
 import { IntervalService } from "@trigger.dev/core/v3";
-import { Counter, Gauge, Registry } from "prom-client";
+import { SimpleStructuredLogger } from "@trigger.dev/core/v3/utils/structuredLogger";
+import type { Registry } from "prom-client";
+import { Counter, Gauge } from "prom-client";
+import type { K8sApi } from "../clients/kubernetes.js";
+import { createK8sApi } from "../clients/kubernetes.js";
 import { register } from "../metrics.js";
 
 export type PodCleanerOptions = {
@@ -90,7 +91,7 @@ export class PodCleaner {
           status: "succeeded",
         });
 
-        this.logger.info("Deleted batch of pods", { continuationToken });
+        this.logger.debug("Deleted batch of pods", { continuationToken });
       } catch (err) {
         this.logger.error("Failed to delete batch of pods", {
           err: err instanceof Error ? err.message : String(err),

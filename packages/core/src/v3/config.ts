@@ -7,12 +7,12 @@ import type {
   AnyOnInitHookFunction,
   AnyOnStartHookFunction,
   AnyOnSuccessHookFunction,
-  BuildRuntime,
+  ConfigRuntime,
   RetryOptions,
 } from "./index.js";
 import type { LogLevel } from "./logger/taskLogger.js";
 import type { MachinePresetName } from "./schemas/common.js";
-import { LogRecordExporter } from "@opentelemetry/sdk-logs";
+import type { LogRecordExporter } from "@opentelemetry/sdk-logs";
 import type { Resource } from "@opentelemetry/resources";
 
 export type CompatibilityFlag = "run_engine_v2";
@@ -44,7 +44,7 @@ export type TriggerConfig = {
   /**
    * @default "node"
    */
-  runtime?: BuildRuntime;
+  runtime?: ConfigRuntime;
 
   /**
    * Specify the project ref for your trigger.dev tasks. This is the project ref that you get when you create a new project in the trigger.dev dashboard.
@@ -175,6 +175,25 @@ export type TriggerConfig = {
    * @see https://trigger.dev/docs/tasks/overview#maxduration-option
    */
   maxDuration: number;
+
+  /**
+   * Set a default time-to-live (TTL) for all task runs in the project. If a run is not executed within this time, it will be removed from the queue and never execute.
+   *
+   * This can be a string like "1h" (1 hour), "30m" (30 minutes), "1d" (1 day), or a number of seconds.
+   *
+   * You can override this on a per-task basis by setting the `ttl` option on the task definition, or per-trigger by setting the `ttl` option when triggering.
+   *
+   * @example
+   *
+   * ```ts
+   * export default defineConfig({
+   *   project: "my-project",
+   *   maxDuration: 3600,
+   *   ttl: "1h",
+   * });
+   * ```
+   */
+  ttl?: string | number;
 
   /**
    * Enable console logging while running the dev CLI. This will print out logs from console.log, console.warn, and console.error. By default all logs are sent to the trigger.dev backend, and not logged to the console.

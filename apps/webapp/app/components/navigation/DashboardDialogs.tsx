@@ -4,6 +4,7 @@ import { motion } from "framer-motion";
 import { ArrowUpCircleIcon } from "@heroicons/react/24/outline";
 import { PlusIcon } from "@heroicons/react/20/solid";
 import { useEffect, useState } from "react";
+import { type ShortcutDefinition } from "~/hooks/useShortcutKeys";
 import { type MatchedOrganization, useDashboardLimits } from "~/hooks/useOrganizations";
 import { useCurrentPlan } from "~/routes/_app.orgs.$organizationSlug/route";
 import { Feedback } from "~/components/Feedback";
@@ -23,8 +24,50 @@ import { Label } from "../primitives/Label";
 import { Paragraph } from "../primitives/Paragraph";
 import { TextLink } from "../primitives/TextLink";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "../primitives/Tooltip";
+import { useThemeColor } from "~/hooks/useThemeColor";
 import { v3BillingPath } from "~/utils/pathBuilder";
 import { type SideMenuEnvironment, type SideMenuProject } from "./SideMenu";
+
+function useCreateDashboard({
+  organization,
+  project,
+  environment,
+}: {
+  organization: { slug: string };
+  project: { slug: string };
+  environment: { slug: string };
+}) {
+  const [isOpen, setIsOpen] = useState(false);
+  const navigation = useNavigation();
+  const limits = useDashboardLimits();
+  const plan = useCurrentPlan();
+
+  const isAtLimit = limits.used >= limits.limit;
+  const planLimits = (plan?.v3Subscription?.plan?.limits as any)?.metricDashboards;
+  const canExceed = typeof planLimits === "object" && planLimits.canExceed === true;
+  const canUpgrade = plan?.v3Subscription?.plan && !canExceed;
+  const isFreePlan = plan?.v3Subscription?.isPaying === false;
+
+  const formAction = `/resources/orgs/${organization.slug}/projects/${project.slug}/env/${environment.slug}/dashboards/create`;
+
+  useEffect(() => {
+    if (navigation.formAction === formAction && navigation.state === "loading") {
+      // oxlint-disable-next-line react/set-state-in-effect -- This effect intentionally synchronizes local state after an external or lifecycle change.
+      setIsOpen(false);
+    }
+  }, [navigation.formAction, navigation.state, formAction]);
+
+  return {
+    isOpen,
+    setIsOpen,
+    isAtLimit,
+    canUpgrade: !!canUpgrade,
+    isFreePlan,
+    formAction,
+    limits,
+    organization,
+  };
+}
 
 export function CreateDashboardButton({
   organization,
@@ -37,36 +80,19 @@ export function CreateDashboardButton({
   environment: SideMenuEnvironment;
   isCollapsed: boolean;
 }) {
-  const [isOpen, setIsOpen] = useState(false);
-  const navigation = useNavigation();
-  const limits = useDashboardLimits();
-  const plan = useCurrentPlan();
-
-  const isAtLimit = limits.used >= limits.limit;
-  const planLimits = (plan?.v3Subscription?.plan?.limits as any)?.metricDashboards;
-  const canExceed = typeof planLimits === "object" && planLimits.canExceed === true;
-  const canUpgrade = plan?.v3Subscription?.plan && !canExceed;
-
-  const formAction = `/resources/orgs/${organization.slug}/projects/${project.slug}/env/${environment.slug}/dashboards/create`;
-
-  // Close dialog when form submission starts (redirect is happening)
-  useEffect(() => {
-    if (navigation.formAction === formAction && navigation.state === "loading") {
-      setIsOpen(false);
-    }
-  }, [navigation.formAction, navigation.state, formAction]);
+  const dashboard = useCreateDashboard({ organization, project, environment });
 
   if (isCollapsed) return null;
 
   return (
-    <Dialog open={isOpen} onOpenChange={setIsOpen}>
+    <Dialog open={dashboard.isOpen} onOpenChange={dashboard.setIsOpen}>
       <TooltipProvider disableHoverableContent>
         <Tooltip>
           <TooltipTrigger asChild>
             <DialogTrigger asChild>
               <button
                 type="button"
-                className="flex h-full w-full items-center justify-center rounded text-text-dimmed transition focus-custom hover:bg-charcoal-600 hover:text-text-bright"
+                className="flex h-full w-full items-center justify-center rounded text-text-dimmed focus-custom hover:bg-surface-control hover:text-text-bright"
               >
                 <PlusIcon className="size-4" />
               </button>
@@ -77,15 +103,59 @@ export function CreateDashboardButton({
           </TooltipContent>
         </Tooltip>
       </TooltipProvider>
-      {isAtLimit ? (
+      {dashboard.isAtLimit ? (
         <CreateDashboardUpgradeDialog
-          limits={limits}
-          canUpgrade={!!canUpgrade}
-          isFreePlan={plan?.v3Subscription?.isPaying === false}
-          organization={organization}
+          limits={dashboard.limits}
+          canUpgrade={dashboard.canUpgrade}
+          isFreePlan={dashboard.isFreePlan}
+          organization={dashboard.organization}
         />
       ) : (
-        <CreateDashboardDialog formAction={formAction} limits={limits} />
+        <CreateDashboardDialog formAction={dashboard.formAction} limits={dashboard.limits} />
+      )}
+    </Dialog>
+  );
+}
+
+export function CreateDashboardPageButton({
+  organization,
+  project,
+  environment,
+  shortcut,
+  children,
+}: {
+  organization: { slug: string };
+  project: { slug: string };
+  environment: { slug: string };
+  shortcut?: ShortcutDefinition;
+  /** Custom trigger element. When omitted, a default primary button is rendered. */
+  children?: React.ReactNode;
+}) {
+  const dashboard = useCreateDashboard({ organization, project, environment });
+
+  return (
+    <Dialog open={dashboard.isOpen} onOpenChange={dashboard.setIsOpen}>
+      <DialogTrigger asChild>
+        {children ?? (
+          <Button
+            variant="primary/small"
+            LeadingIcon={PlusIcon}
+            shortcut={shortcut}
+            className="pr-2"
+          >
+            Create custom dashboard
+          </Button>
+        )}
+      </DialogTrigger>
+      {dashboard.isAtLimit ? (
+        <CreateDashboardUpgradeDialog
+          limits={dashboard.limits}
+          canUpgrade={dashboard.canUpgrade}
+          isFreePlan={dashboard.isFreePlan}
+          organization={dashboard.organization}
+        />
+      ) : (
+        <CreateDashboardDialog formAction={dashboard.formAction} limits={dashboard.limits} />
       )}
     </Dialog>
   );
@@ -93,8 +163,6 @@ export function CreateDashboardButton({
 
 const PROGRESS_RING_R = 27.5;
 const PROGRESS_RING_CIRCUMFERENCE = 2 * Math.PI * PROGRESS_RING_R;
-const PROGRESS_COLOR_SUCCESS = "#28BF5C"; // mint-500 / success
-const PROGRESS_COLOR_ERROR = "#E11D48"; // rose-600 / error
 
 function CreateDashboardUpgradeDialog({
   limits,
@@ -105,8 +173,12 @@ function CreateDashboardUpgradeDialog({
   limits: { used: number; limit: number };
   canUpgrade: boolean;
   isFreePlan: boolean;
-  organization: MatchedOrganization;
+  organization: { slug: string };
 }) {
+  // Resolved to concrete colors - framer-motion can't interpolate var() strings.
+  // Must be called before the early return below (rules of hooks).
+  const progressColorSuccess = useThemeColor("--color-success", "#28bf5c");
+  const progressColorError = useThemeColor("--color-error", "#e11d48");
 
   if (isFreePlan) {
     return (
@@ -156,11 +228,11 @@ function CreateDashboardUpgradeDialog({
               strokeLinecap="round"
               initial={{
                 strokeDasharray: `0 ${PROGRESS_RING_CIRCUMFERENCE}`,
-                stroke: PROGRESS_COLOR_SUCCESS,
+                stroke: progressColorSuccess,
               }}
               animate={{
                 strokeDasharray: `${filled} ${PROGRESS_RING_CIRCUMFERENCE}`,
-                stroke: PROGRESS_COLOR_ERROR,
+                stroke: progressColorError,
               }}
               transition={{ duration: 1.2, ease: "easeInOut" }}
             />

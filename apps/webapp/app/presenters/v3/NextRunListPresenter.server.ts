@@ -1,5 +1,6 @@
 import { type ClickHouse } from "@internal/clickhouse";
-import { MachinePresetName } from "@trigger.dev/core/v3";
+import type { MachinePresetName } from "@trigger.dev/core/v3";
+import { RunAnnotations } from "@trigger.dev/core/v3/schemas";
 import {
   type PrismaClient,
   type PrismaClientOrTransaction,
@@ -8,11 +9,54 @@ import {
 import { type Direction } from "~/components/ListPagination";
 import { timeFilters } from "~/components/runs/v3/SharedFilters";
 import { findDisplayableEnvironment } from "~/models/runtimeEnvironment.server";
-import { getAllTaskIdentifiers } from "~/models/task.server";
+import { getTaskIdentifiers } from "~/models/task.server";
 import { RunsRepository } from "~/services/runsRepository/runsRepository.server";
+import { env } from "~/env.server";
+import {
+  createCache,
+  createLRUMemoryStore,
+  DefaultStatefulContext,
+  Namespace,
+} from "@internal/cache";
+import { RedisCacheStore } from "~/services/unkey/redisCacheStore.server";
+import { singleton } from "~/utils/singleton";
+import { regionForDisplay } from "~/runEngine/concerns/workerQueueSplit.server";
 import { machinePresetFromRun } from "~/v3/machinePresets.server";
 import { ServiceValidationError } from "~/v3/services/baseService.server";
 import { isCancellableRunStatus, isFinalRunStatus, isPendingRunStatus } from "~/v3/taskStatus";
+import { runTriggeredAt } from "~/v3/runTimestamps";
+import {
+  deriveRunSelect,
+  type RunColumnId,
+  type SmartColumnSource,
+} from "~/components/runs/v3/runColumns";
+
+// Positive-only cache: only envs known to have runs are stored (empty envs are re-checked),
+// so "has runs" is monotonic and the TTL can be very long. Tiered memory + Redis.
+const runsExistCache = singleton("runsExistCache", () => {
+  const ctx = new DefaultStatefulContext();
+  const memory = createLRUMemoryStore(5000, "runs-has-runs-cache");
+  const redis = new RedisCacheStore({
+    name: "runs-has-runs",
+    connection: {
+      keyPrefix: "tr:cache:runs-has-runs",
+      port: env.CACHE_REDIS_PORT,
+      host: env.CACHE_REDIS_HOST,
+      username: env.CACHE_REDIS_USERNAME,
+      password: env.CACHE_REDIS_PASSWORD,
+      tlsDisabled: env.CACHE_REDIS_TLS_DISABLED === "true",
+      clusterMode: env.CACHE_REDIS_CLUSTER_MODE_ENABLED === "1",
+    },
+  });
+
+  return createCache({
+    hasRuns: new Namespace<boolean>(ctx, {
+      stores: [memory, redis],
+      fresh: env.RUN_LIST_HAS_RUNS_CACHE_FRESH_MS,
+      stale: env.RUN_LIST_HAS_RUNS_CACHE_STALE_MS,
+    }),
+  });
+});
 
 export type RunListOptions = {
   userId?: string;
@@ -32,11 +76,25 @@ export type RunListOptions = {
   batchId?: string;
   runId?: string[];
   queues?: string[];
+  regions?: string[];
   machines?: MachinePresetName[];
+  errorId?: string;
+  sources?: string[];
   //pagination
   direction?: Direction;
   cursor?: string;
   pageSize?: number;
+  // Run the empty-state "has any run ever" probe. Only the runs list consumes it.
+  includeHasAnyRuns?: boolean;
+  /**
+   * Visible-column set used to derive the Postgres select. Omitted => the
+   * default select (all fields, no payload/output). Provided by the list route
+   * so payload/output are only hydrated when a smart column references them.
+   */
+  columns?: {
+    visibleStandardIds: RunColumnId[];
+    smartSources: SmartColumnSource[];
+  };
 };
 
 const DEFAULT_PAGE_SIZE = 25;
@@ -48,8 +106,44 @@ export type NextRunListAppliedFilters = NextRunList["filters"];
 export class NextRunListPresenter {
   constructor(
     private readonly replica: PrismaClientOrTransaction,
-    private readonly clickhouse: ClickHouse
+    private readonly clickhouse: ClickHouse,
+    private readonly readThroughDeps?: {
+      // The new run-ops client + the legacy run-ops read replica (never the legacy writer).
+      // Omitted => single-DB / self-host: both default to `replica` (passthrough).
+      newClient?: PrismaClientOrTransaction;
+      legacyReplica?: PrismaClientOrTransaction;
+      // Resolved boot constant from isSplitEnabled(). When false/absent:
+      // list hydrate runs passthrough and the empty-state probe is one plain findFirst.
+      splitEnabled?: boolean;
+    }
   ) {}
+
+  // Empty-state existence probe, served from ClickHouse (same connection as the runs
+  // list) so it no longer scans TaskRun in Postgres. SWR-cached to spare ClickHouse;
+  // RUN_LIST_HAS_RUNS_LOOKBACK_DAYS bounds the prove-absence partition scan.
+  async #anyRunExistsInEnv(
+    runsRepository: RunsRepository,
+    organizationId: string,
+    projectId: string,
+    environmentId: string
+  ): Promise<boolean> {
+    const lookbackDays = env.RUN_LIST_HAS_RUNS_LOOKBACK_DAYS;
+    const createdAtLowerBoundMs =
+      lookbackDays > 0 ? Date.now() - lookbackDays * 24 * 60 * 60 * 1000 : undefined;
+
+    const result = await runsExistCache.hasRuns.swr(environmentId, async () => {
+      const exists = await runsRepository.runExistsInEnvironment({
+        organizationId,
+        projectId,
+        environmentId,
+        createdAtLowerBoundMs,
+      });
+      // undefined (not false) so swr does NOT cache the empty result — re-check until a run exists.
+      return exists ? true : undefined;
+    });
+
+    return result.val ?? false;
+  }
 
   public async call(
     organizationId: string,
@@ -69,12 +163,17 @@ export class NextRunListPresenter {
       batchId,
       runId,
       queues,
+      regions,
       machines,
+      errorId,
+      sources,
       from,
       to,
       direction = "forward",
       cursor,
       pageSize = DEFAULT_PAGE_SIZE,
+      includeHasAnyRuns = false,
+      columns,
     }: RunListOptions
   ) {
     //get the time values from the raw values (including a default period)
@@ -87,6 +186,7 @@ export class NextRunListPresenter {
     const hasStatusFilters = statuses && statuses.length > 0;
 
     const hasFilters =
+      (sources !== undefined && sources.length > 0) ||
       (tasks !== undefined && tasks.length > 0) ||
       (versions !== undefined && versions.length > 0) ||
       hasStatusFilters ||
@@ -96,15 +196,15 @@ export class NextRunListPresenter {
       batchId !== undefined ||
       (runId !== undefined && runId.length > 0) ||
       (queues !== undefined && queues.length > 0) ||
+      (regions !== undefined && regions.length > 0) ||
       (machines !== undefined && machines.length > 0) ||
+      (errorId !== undefined && errorId !== "") ||
       typeof isTest === "boolean" ||
       rootOnly === true ||
       !time.isDefault;
 
-    //get all possible tasks
-    const possibleTasksAsync = getAllTaskIdentifiers(this.replica, environmentId);
+    const possibleTasksAsync = getTaskIdentifiers(environmentId);
 
-    //get possible bulk actions
     const bulkActionsAsync = this.replica.bulkActionGroup.findMany({
       select: {
         friendlyId: true,
@@ -156,6 +256,13 @@ export class NextRunListPresenter {
     const runsRepository = new RunsRepository({
       clickhouse: this.clickhouse,
       prisma: this.replica as PrismaClient,
+      readThrough: this.readThroughDeps
+        ? {
+            newClient: this.readThroughDeps.newClient ?? this.replica,
+            legacyReplica: this.readThroughDeps.legacyReplica ?? this.replica,
+            splitEnabled: this.readThroughDeps.splitEnabled ?? false,
+          }
+        : undefined,
     });
 
     function clampToNow(date: Date): Date {
@@ -163,7 +270,12 @@ export class NextRunListPresenter {
       return date > now ? now : date;
     }
 
+    const runSelect = columns
+      ? deriveRunSelect(columns.visibleStandardIds, columns.smartSources)
+      : undefined;
+
     const { runs, pagination } = await runsRepository.listRuns({
+      runSelect,
       organizationId,
       environmentId,
       projectId,
@@ -181,7 +293,10 @@ export class NextRunListPresenter {
       runId,
       bulkId,
       queues,
+      regions,
       machines,
+      errorId,
+      taskKinds: sources,
       page: {
         size: pageSize,
         cursor,
@@ -191,16 +306,13 @@ export class NextRunListPresenter {
 
     let hasAnyRuns = runs.length > 0;
 
-    if (!hasAnyRuns) {
-      const firstRun = await this.replica.taskRun.findFirst({
-        where: {
-          runtimeEnvironmentId: environmentId,
-        },
-      });
-
-      if (firstRun) {
-        hasAnyRuns = true;
-      }
+    if (!hasAnyRuns && includeHasAnyRuns) {
+      hasAnyRuns = await this.#anyRunExistsInEnv(
+        runsRepository,
+        organizationId,
+        projectId,
+        environmentId
+      );
     }
 
     return {
@@ -208,18 +320,20 @@ export class NextRunListPresenter {
         const hasFinished = isFinalRunStatus(run.status);
 
         const startedAt = run.startedAt ?? run.lockedAt;
+        const triggeredAt = runTriggeredAt(run);
 
         return {
           id: run.id,
           number: 1,
           friendlyId: run.friendlyId,
           createdAt: run.createdAt.toISOString(),
+          triggeredAt: triggeredAt.toISOString(),
           updatedAt: run.updatedAt.toISOString(),
           startedAt: startedAt ? startedAt.toISOString() : undefined,
           delayUntil: run.delayUntil ? run.delayUntil.toISOString() : undefined,
           hasFinished,
           finishedAt: hasFinished
-            ? run.completedAt?.toISOString() ?? run.updatedAt.toISOString()
+            ? (run.completedAt?.toISOString() ?? run.updatedAt.toISOString())
             : undefined,
           isTest: run.isTest,
           status: run.status,
@@ -241,22 +355,24 @@ export class NextRunListPresenter {
           rootTaskRunId: run.rootTaskRunId,
           metadata: run.metadata,
           metadataType: run.metadataType,
+          payload: run.payload,
+          payloadType: run.payloadType,
+          output: run.output,
+          outputType: run.outputType,
           machinePreset: run.machinePreset ? machinePresetFromRun(run)?.name : undefined,
           queue: {
             name: run.queue.replace("task/", ""),
             type: run.queue.startsWith("task/") ? "task" : "custom",
           },
+          region: regionForDisplay(run.region, run.workerQueue),
+          taskKind: RunAnnotations.safeParse(run.annotations).data?.taskKind ?? "STANDARD",
         };
       }),
       pagination: {
         next: pagination.nextCursor ?? undefined,
         previous: pagination.previousCursor ?? undefined,
       },
-      possibleTasks: possibleTasks
-        .map((task) => ({ slug: task.slug, triggerSource: task.triggerSource }))
-        .sort((a, b) => {
-          return a.slug.localeCompare(b.slug);
-        }),
+      possibleTasks,
       bulkActions: bulkActions.map((bulkAction) => ({
         id: bulkAction.friendlyId,
         type: bulkAction.type,

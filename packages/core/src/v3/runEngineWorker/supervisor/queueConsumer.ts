@@ -1,7 +1,8 @@
 import { SimpleStructuredLogger } from "../../utils/structuredLogger.js";
-import { SupervisorHttpClient } from "./http.js";
-import { WorkerApiDequeueResponseBody } from "./schemas.js";
-import { PreDequeueFn, PreSkipFn } from "./types.js";
+import type { SupervisorHttpClient } from "./http.js";
+import type { WorkerApiDequeueResponseBody, WorkerQueueClass } from "./schemas.js";
+import type { PreDequeueFn, PreSkipFn } from "./types.js";
+import type { ConsumerPoolMetrics } from "./consumerPoolMetrics.js";
 
 export interface QueueConsumer {
   start(): void;
@@ -15,7 +16,14 @@ export type RunQueueConsumerOptions = {
   preDequeue?: PreDequeueFn;
   preSkip?: PreSkipFn;
   maxRunCount?: number;
-  onDequeue: (messages: WorkerApiDequeueResponseBody) => Promise<void>;
+  /** Which worker-queue class this consumer pulls from. Defaults to the worker's region queue. */
+  queueClass?: WorkerQueueClass;
+  onDequeue: (
+    messages: WorkerApiDequeueResponseBody,
+    timing?: { dequeueResponseMs: number; pollingIntervalMs: number }
+  ) => Promise<void>;
+  /** Optional shared pool metrics. When provided, dequeue API latency is recorded as a histogram. */
+  metrics?: ConsumerPoolMetrics;
 };
 
 export class RunQueueConsumer implements QueueConsumer {
@@ -23,13 +31,19 @@ export class RunQueueConsumer implements QueueConsumer {
   private readonly preDequeue?: PreDequeueFn;
   private readonly preSkip?: PreSkipFn;
   private readonly maxRunCount?: number;
-  private readonly onDequeue: (messages: WorkerApiDequeueResponseBody) => Promise<void>;
+  private readonly queueClass?: WorkerQueueClass;
+  private readonly onDequeue: (
+    messages: WorkerApiDequeueResponseBody,
+    timing?: { dequeueResponseMs: number; pollingIntervalMs: number }
+  ) => Promise<void>;
+  private readonly metrics?: ConsumerPoolMetrics;
 
   private readonly logger = new SimpleStructuredLogger("queue-consumer");
 
   private intervalMs: number;
   private idleIntervalMs: number;
   private isEnabled: boolean;
+  private lastScheduledIntervalMs: number;
 
   constructor(opts: RunQueueConsumerOptions) {
     this.isEnabled = false;
@@ -38,8 +52,11 @@ export class RunQueueConsumer implements QueueConsumer {
     this.preDequeue = opts.preDequeue;
     this.preSkip = opts.preSkip;
     this.maxRunCount = opts.maxRunCount;
+    this.queueClass = opts.queueClass;
+    this.lastScheduledIntervalMs = opts.idleIntervalMs;
     this.onDequeue = opts.onDequeue;
     this.client = opts.client;
+    this.metrics = opts.metrics;
   }
 
   start() {
@@ -110,17 +127,31 @@ export class RunQueueConsumer implements QueueConsumer {
 
     let nextIntervalMs = this.idleIntervalMs;
 
+    const dequeueStart = performance.now();
+
     try {
       const response = await this.client.dequeue({
         maxResources: preDequeueResult?.maxResources,
         maxRunCount: this.maxRunCount,
+        queueClass: this.queueClass,
       });
+      const dequeueDurationSeconds = (performance.now() - dequeueStart) / 1000;
+      const dequeueResponseMs = Math.round(dequeueDurationSeconds * 1000);
 
       if (!response.success) {
+        this.metrics?.observeDequeueLatency(dequeueDurationSeconds, "error");
         this.logger.error("Failed to dequeue", { error: response.error });
       } else {
+        this.metrics?.observeDequeueLatency(
+          dequeueDurationSeconds,
+          response.data.length > 0 ? "success" : "empty"
+        );
+
         try {
-          await this.onDequeue(response.data);
+          await this.onDequeue(response.data, {
+            dequeueResponseMs,
+            pollingIntervalMs: this.lastScheduledIntervalMs,
+          });
 
           if (response.data.length > 0) {
             nextIntervalMs = this.intervalMs;
@@ -130,6 +161,10 @@ export class RunQueueConsumer implements QueueConsumer {
         }
       }
     } catch (clientError) {
+      // wrapZodFetch traps all errors into { success: false }, so this branch is
+      // unreachable with the real client today. Record defensively so a future
+      // client that throws can't silently lose error samples.
+      this.metrics?.observeDequeueLatency((performance.now() - dequeueStart) / 1000, "error");
       this.logger.error("client.dequeue error", { error: clientError });
     }
 
@@ -141,6 +176,7 @@ export class RunQueueConsumer implements QueueConsumer {
       this.logger.verbose("scheduled dequeue with idle interval", { delayMs });
     }
 
+    this.lastScheduledIntervalMs = delayMs;
     setTimeout(this.dequeue.bind(this), delayMs);
   }
 }

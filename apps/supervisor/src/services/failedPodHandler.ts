@@ -1,10 +1,11 @@
+import type { Informer, V1Pod } from "@kubernetes/client-node";
 import { LogLevel, SimpleStructuredLogger } from "@trigger.dev/core/v3/utils/structuredLogger";
-import { K8sApi } from "../clients/kubernetes.js";
-import { createK8sApi } from "../clients/kubernetes.js";
-import { Informer, V1Pod } from "@kubernetes/client-node";
-import { Counter, Registry, Histogram } from "prom-client";
-import { register } from "../metrics.js";
+import type { Registry } from "prom-client";
+import { Counter, Histogram } from "prom-client";
 import { setTimeout } from "timers/promises";
+import type { K8sApi } from "../clients/kubernetes.js";
+import { createK8sApi } from "../clients/kubernetes.js";
+import { register } from "../metrics.js";
 
 type PodStatus = "Pending" | "Running" | "Succeeded" | "Failed" | "Unknown" | "GracefulShutdown";
 
@@ -151,7 +152,7 @@ export class FailedPodHandler {
   }
 
   private async onPodCompleted(pod: V1Pod) {
-    this.logger.info("pod-completed", this.podSummary(pod));
+    this.logger.debug("pod-completed", this.podSummary(pod));
     this.informerEventsTotal.inc({ namespace: this.namespace, verb: "add" });
 
     if (!pod.metadata?.name) {
@@ -165,7 +166,7 @@ export class FailedPodHandler {
     }
 
     if (pod.metadata?.deletionTimestamp) {
-      this.logger.info("pod-completed: pod is being deleted", this.podSummary(pod));
+      this.logger.verbose("pod-completed: pod is being deleted", this.podSummary(pod));
       return;
     }
 
@@ -188,7 +189,7 @@ export class FailedPodHandler {
   }
 
   private async onPodSucceeded(pod: V1Pod) {
-    this.logger.info("pod-succeeded", this.podSummary(pod));
+    this.logger.debug("pod-succeeded", this.podSummary(pod));
     this.processedPodsTotal.inc({
       namespace: this.namespace,
       status: this.podStatus(pod),
@@ -196,7 +197,7 @@ export class FailedPodHandler {
   }
 
   private async onPodFailed(pod: V1Pod) {
-    this.logger.info("pod-failed", this.podSummary(pod));
+    this.logger.debug("pod-failed", this.podSummary(pod));
 
     try {
       await this.processFailedPod(pod);
@@ -208,7 +209,7 @@ export class FailedPodHandler {
   }
 
   private async processFailedPod(pod: V1Pod) {
-    this.logger.info("pod-failed: processing pod", this.podSummary(pod));
+    this.logger.verbose("pod-failed: processing pod", this.podSummary(pod));
 
     const mainContainer = pod.status?.containerStatuses?.find((c) => c.name === "run-controller");
 
@@ -231,7 +232,7 @@ export class FailedPodHandler {
   }
 
   private async deletePod(pod: V1Pod) {
-    this.logger.info("pod-failed: deleting pod", this.podSummary(pod));
+    this.logger.verbose("pod-failed: deleting pod", this.podSummary(pod));
     try {
       await this.k8s.core.deleteNamespacedPod({
         name: pod.metadata!.name!,

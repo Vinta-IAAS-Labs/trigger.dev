@@ -1,16 +1,15 @@
 import { type ActionFunctionArgs, json } from "@remix-run/server-runtime";
-import {
-  type CompleteWaitpointTokenResponseBody,
-  conditionallyExportPacket,
-  stringifyIO,
-} from "@trigger.dev/core/v3";
+import { type CompleteWaitpointTokenResponseBody, stringifyIO } from "@trigger.dev/core/v3";
 import { WaitpointId } from "@trigger.dev/core/v3/isomorphic";
 import { z } from "zod";
-import { $replica } from "~/db.server";
 import { env } from "~/env.server";
+import { processWaitpointCompletionPacket } from "~/runEngine/concerns/waitpointCompletionPacket.server";
 import { verifyHttpCallbackHash } from "~/services/httpCallback.server";
 import { logger } from "~/services/logger.server";
+import { unroutableIdResponse } from "~/services/routeBuilders/unroutableId.server";
+import { controlPlaneResolver } from "~/v3/runOpsMigration/controlPlaneResolver.server";
 import { engine } from "~/v3/runEngine.server";
+import { runStore } from "~/v3/runStore.server";
 
 const paramsSchema = z.object({
   waitpointFriendlyId: z.string(),
@@ -35,25 +34,32 @@ export async function action({ request, params }: ActionFunctionArgs) {
   const waitpointId = WaitpointId.toId(waitpointFriendlyId);
 
   try {
-    const waitpoint = await $replica.waitpoint.findFirst({
+    // Resolve wherever the waitpoint resides. The store routes by the waitpoint id's residency
+    // (id-shape) and probes both run-ops DBs, so a token on either store resolves; the env is
+    // resolved below from the row via the control-plane resolver.
+    let waitpoint = await runStore.findWaitpoint({
       where: {
         id: waitpointId,
       },
-      include: {
-        environment: {
-          select: {
-            apiKey: true,
-            parentEnvironment: {
-              select: {
-                apiKey: true,
-              },
-            },
-          },
-        },
-      },
+      select: { id: true, status: true, environmentId: true },
     });
 
     if (!waitpoint) {
+      // Read-your-writes: a token whose callback fires right after mint may not have replicated
+      // yet. Re-read the owning primary before 404ing (mirrors complete.ts's primary fallback).
+      waitpoint = await runStore.findWaitpointOnPrimary({
+        where: { id: waitpointId },
+        select: { id: true, status: true, environmentId: true },
+      });
+    }
+
+    if (!waitpoint) {
+      return json({ error: "Waitpoint not found" }, { status: 404 });
+    }
+
+    const environment = await controlPlaneResolver.resolveAuthenticatedEnv(waitpoint.environmentId);
+
+    if (!environment) {
       return json({ error: "Waitpoint not found" }, { status: 404 });
     }
 
@@ -61,7 +67,7 @@ export async function action({ request, params }: ActionFunctionArgs) {
       !verifyHttpCallbackHash(
         waitpoint.id,
         hash,
-        waitpoint.environment.parentEnvironment?.apiKey ?? waitpoint.environment.apiKey
+        environment.parentEnvironment?.apiKey ?? environment.apiKey
       )
     ) {
       return json({ error: "Invalid URL, hash doesn't match" }, { status: 401 });
@@ -77,12 +83,13 @@ export async function action({ request, params }: ActionFunctionArgs) {
     const body = await request.json().catch(() => ({}));
 
     const stringifiedData = await stringifyIO(body);
-    const finalData = await conditionallyExportPacket(
+    const finalData = await processWaitpointCompletionPacket(
       stringifiedData,
-      `${waitpointId}/waitpoint/http-callback`
+      environment,
+      `${WaitpointId.toFriendlyId(waitpointId)}/http-callback`
     );
 
-    const result = await engine.completeWaitpoint({
+    const _result = await engine.completeWaitpoint({
       id: waitpointId,
       output: finalData.data
         ? { type: finalData.dataType, value: finalData.data, isError: false }
@@ -96,6 +103,19 @@ export async function action({ request, params }: ActionFunctionArgs) {
       { status: 200 }
     );
   } catch (error) {
+    // Same as the complete route: the waitpoint id comes off the URL, so an unconfigured shard
+    // key is caller-supplied input and must answer 404 rather than 500. This route is a bare
+    // Remix action, so the api-builder boundary never sees the error — answer it here.
+    const unroutable = unroutableIdResponse(error);
+    if (unroutable) {
+      // Same reason as the complete route: a silent 404 would hide a dropped shard key.
+      logger.warn("Unroutable waitpoint id on HTTP callback", {
+        waitpointFriendlyId: params.waitpointFriendlyId,
+        error: error instanceof Error ? error.message : error,
+      });
+      return unroutable;
+    }
+
     logger.error("Failed to complete HTTP callback", { error });
     throw json({ error: "Failed to complete HTTP callback" }, { status: 500 });
   }

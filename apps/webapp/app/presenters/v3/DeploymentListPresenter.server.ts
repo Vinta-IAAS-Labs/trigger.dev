@@ -17,7 +17,7 @@ import {
 
 const pageSize = 20;
 
-export type DeploymentList = Awaited<ReturnType<DeploymentListPresenter["call"]>>;
+type DeploymentList = Awaited<ReturnType<DeploymentListPresenter["call"]>>;
 export type DeploymentListItem = DeploymentList["deployments"][0];
 
 export class DeploymentListPresenter {
@@ -43,24 +43,6 @@ export class DeploymentListPresenter {
     const project = await this.#prismaClient.project.findFirstOrThrow({
       select: {
         id: true,
-        environments: {
-          select: {
-            id: true,
-            type: true,
-            slug: true,
-            orgMember: {
-              select: {
-                user: {
-                  select: {
-                    id: true,
-                    name: true,
-                    displayName: true,
-                  },
-                },
-              },
-            },
-          },
-        },
         connectedGithubRepository: {
           select: {
             branchTracking: true,
@@ -165,12 +147,13 @@ export class DeploymentListPresenter {
         environmentId: string;
         builtAt: Date | null;
         deployedAt: Date | null;
-        tasksCount: BigInt | null;
+        tasksCount: bigint | null;
         userId: string | null;
         userName: string | null;
         userDisplayName: string | null;
         userAvatarUrl: string | null;
         type: WorkerInstanceGroupType;
+        externalId: string | null;
         git: Prisma.JsonValue | null;
         integrationDeploymentId: string | null;
       }[]
@@ -191,6 +174,7 @@ export class DeploymentListPresenter {
   wd."builtAt",
   wd."deployedAt",
   wd."type",
+  wd."externalId",
   wd."git"
   ${vercelSelect}
 FROM
@@ -234,7 +218,12 @@ LIMIT ${pageSize} OFFSET ${pageSize * (page - 1)};`;
         );
 
         let vercelDeploymentUrl: string | null = null;
-        if (hasVercelIntegration && deployment.integrationDeploymentId && vercelTeamSlug && vercelProjectName) {
+        if (
+          hasVercelIntegration &&
+          deployment.integrationDeploymentId &&
+          vercelTeamSlug &&
+          vercelProjectName
+        ) {
           vercelDeploymentUrl = buildVercelDeploymentUrl(
             vercelTeamSlug,
             vercelProjectName,
@@ -271,6 +260,7 @@ LIMIT ${pageSize} OFFSET ${pageSize * (page - 1)};`;
                 avatarUrl: deployment.userAvatarUrl,
               }
             : undefined,
+          externalId: deployment.externalId,
           git: processGitMetadata(deployment.git),
           vercelDeploymentUrl,
         };
@@ -314,7 +304,7 @@ LIMIT ${pageSize} OFFSET ${pageSize * (page - 1)};`;
     }
 
     // Find how many deployments have been made since this version
-    const deploymentsSinceVersion = await this.#prismaClient.$queryRaw<{ count: BigInt }[]>`
+    const deploymentsSinceVersion = await this.#prismaClient.$queryRaw<{ count: bigint }[]>`
       SELECT COUNT(*) as count
       FROM ${sqlDatabaseSchema}."WorkerDeployment"
       WHERE "projectId" = ${project.id}

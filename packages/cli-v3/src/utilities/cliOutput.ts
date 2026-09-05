@@ -1,13 +1,12 @@
 import { log } from "@clack/prompts";
 import chalk from "chalk";
-import { terminalLink, TerminalLinkOptions } from "./terminalLink.js";
-import { hasTTY } from "std-env";
+import type { TerminalLinkOptions } from "./terminalLink.js";
+import { terminalLink } from "./terminalLink.js";
 
-export const isInteractive = hasTTY;
 export const isLinksSupported = terminalLink.isSupported;
 
-export const green = "#4FFF54";
-export const purple = "#735BF3";
+const green = "#4FFF54";
+const purple = "#735BF3";
 
 export function chalkGreen(text: string) {
   return chalk.hex(green)(text);

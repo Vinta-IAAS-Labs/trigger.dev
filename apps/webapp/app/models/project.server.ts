@@ -1,10 +1,14 @@
-import { nanoid, customAlphabet } from "nanoid";
+import type { Prisma, Project } from "@trigger.dev/database";
+import { customAlphabet, nanoid } from "nanoid";
 import slug from "slug";
 import { $replica, prisma } from "~/db.server";
-import type { Project } from "@trigger.dev/database";
-import { Organization, createEnvironment } from "./organization.server";
-import { env } from "~/env.server";
-import { projectCreated } from "~/services/platform.v3.server";
+import { projectCreated } from "~/services/projectCreated.server";
+import { ServiceValidationError } from "~/v3/services/common.server";
+import {
+  type Organization,
+  createDevelopmentEnvironmentForMember,
+  createEnvironment,
+} from "./organization.server";
 export type { Project } from "@trigger.dev/database";
 
 const externalRefGenerator = customAlphabet("abcdefghijklmnopqrstuvwxyz", 20);
@@ -14,6 +18,7 @@ type Options = {
   name: string;
   userId: string;
   version: "v2" | "v3";
+  onboardingData?: Prisma.InputJsonValue;
 };
 
 export class ExceededProjectLimitError extends Error {
@@ -24,7 +29,7 @@ export class ExceededProjectLimitError extends Error {
 }
 
 export async function createProject(
-  { organizationSlug, name, userId, version }: Options,
+  { organizationSlug, name, userId, version, onboardingData }: Options,
   attemptCount = 0
 ): Promise<Project & { organization: Organization }> {
   //check the user has permissions to do this
@@ -32,7 +37,7 @@ export async function createProject(
     select: {
       id: true,
       slug: true,
-      v3Enabled: true,
+      isActivated: true,
       maximumConcurrencyLimit: true,
       maximumProjectCount: true,
     },
@@ -49,8 +54,11 @@ export async function createProject(
   }
 
   if (version === "v3") {
-    if (!organization.v3Enabled) {
-      throw new Error(`Organization can't create v3 projects.`);
+    if (!organization.isActivated) {
+      throw new ServiceValidationError(
+        "You must select a plan for this organization before creating projects.",
+        402
+      );
     }
   }
 
@@ -84,6 +92,7 @@ export async function createProject(
         name,
         userId,
         version,
+        onboardingData,
       },
       attemptCount + 1
     );
@@ -100,6 +109,12 @@ export async function createProject(
       },
       externalRef: `proj_${externalRefGenerator()}`,
       version: version === "v3" ? "V3" : "V2",
+      // New projects run on the v2 engine. The Prisma column still defaults to V1
+      // for historical rows; the V1->V2 upgrade guards on worker-register / deploy
+      // stay in place to migrate existing legacy projects.
+      engine: "V2",
+      defaultRuntime: "node-24",
+      onboardingData,
     },
     include: {
       organization: {
@@ -119,11 +134,9 @@ export async function createProject(
   });
 
   for (const member of project.organization.members) {
-    await createEnvironment({
+    await createDevelopmentEnvironmentForMember({
       organization,
       project,
-      type: "DEVELOPMENT",
-      isBranchableEnvironment: false,
       member,
     });
   }

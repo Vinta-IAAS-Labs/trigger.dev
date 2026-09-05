@@ -1,35 +1,51 @@
-import { setTimeout as awaitTimeout } from "node:timers/promises";
-import {
+import { tryCatch } from "@trigger.dev/core/utils";
+import { TaskRunErrorCodes } from "@trigger.dev/core/v3";
+import type {
   BuildManifest,
   CreateBackgroundWorkerRequestBody,
+  DequeuedMessage,
   DevConfigResponseBody,
-  SemanticInternalAttributes,
-  TaskManifest,
   WorkerManifest,
 } from "@trigger.dev/core/v3";
-import { ResolvedConfig } from "@trigger.dev/core/v3/build";
-import { CliApiClient } from "../apiClient.js";
-import { DevCommandOptions } from "../commands/dev.js";
-import { eventBus } from "../utilities/eventBus.js";
-import { logger } from "../utilities/logger.js";
-import { resolveSourceFiles } from "../utilities/sourceFiles.js";
-import { BackgroundWorker } from "./backgroundWorker.js";
-import { WorkerRuntime } from "./workerRuntime.js";
-import { chalkTask, cliLink, prettyError } from "../utilities/cliOutput.js";
-import { DevRunController } from "../entryPoints/dev-run-controller.js";
-import { io, Socket } from "socket.io-client";
-import {
+import type { ResolvedConfig } from "@trigger.dev/core/v3/build";
+import type {
   WorkerClientToServerEvents,
   WorkerServerToClientEvents,
 } from "@trigger.dev/core/v3/workers";
-import pLimit from "p-limit";
-import { resolveLocalEnvVars } from "../utilities/localEnvVars.js";
 import type { Metafile } from "esbuild";
+import { spawn, type ChildProcess } from "node:child_process";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { join } from "node:path";
+import { setTimeout as awaitTimeout } from "node:timers/promises";
+import { fileURLToPath } from "node:url";
+import pLimit from "p-limit";
+import type { Socket } from "socket.io-client";
+import { io } from "socket.io-client";
+import type { CliApiClient } from "../apiClient.js";
+import { copySkillFolders } from "../build/bundleSkills.js";
+import type { DevCommandOptions } from "../commands/dev.js";
+import { DevRunController } from "../entryPoints/dev-run-controller.js";
+import { cliLink, prettyError } from "../utilities/cliOutput.js";
+import { devBranchPathSegment } from "../utilities/devBranch.js";
+import { eventBus } from "../utilities/eventBus.js";
+import { resolveLocalEnvVars } from "../utilities/localEnvVars.js";
+import { logger } from "../utilities/logger.js";
+import { resolveSourceFiles } from "../utilities/sourceFiles.js";
+import { getTmpRoot } from "../utilities/tempDirectories.js";
+import { BackgroundWorker } from "./backgroundWorker.js";
 import { TaskRunProcessPool } from "./taskRunProcessPool.js";
-import { tryCatch } from "@trigger.dev/core/utils";
+import type { WorkerRuntime } from "./workerRuntime.js";
 
 export type WorkerRuntimeOptions = {
   name: string | undefined;
+  branch?: string;
   config: ResolvedConfig;
   args: DevCommandOptions;
   client: CliApiClient;
@@ -71,6 +87,11 @@ class DevSupervisor implements WorkerRuntime {
   private runLimiter?: ReturnType<typeof pLimit>;
   private taskRunProcessPool?: TaskRunProcessPool;
 
+  /** Detached watchdog process that cancels runs if the CLI is killed */
+  private watchdogProcess?: ChildProcess;
+  private activeRunsPath?: string;
+  private watchdogPidPath?: string;
+
   constructor(public readonly options: WorkerRuntimeOptions) {}
 
   async init(): Promise<void> {
@@ -108,14 +129,14 @@ class DevSupervisor implements WorkerRuntime {
       typeof processKeepAlive === "boolean"
         ? processKeepAlive
         : typeof processKeepAlive === "object"
-        ? processKeepAlive.enabled
-        : false;
+          ? processKeepAlive.enabled
+          : false;
 
     const maxPoolSize =
-      typeof processKeepAlive === "object" ? processKeepAlive.devMaxPoolSize ?? 25 : 25;
+      typeof processKeepAlive === "object" ? (processKeepAlive.devMaxPoolSize ?? 25) : 25;
 
     const maxExecutionsPerProcess =
-      typeof processKeepAlive === "object" ? processKeepAlive.maxExecutionsPerProcess ?? 50 : 50;
+      typeof processKeepAlive === "object" ? (processKeepAlive.maxExecutionsPerProcess ?? 50) : 50;
 
     if (enableProcessReuse) {
       logger.debug("[DevSupervisor] Enabling process reuse", {
@@ -138,25 +159,39 @@ class DevSupervisor implements WorkerRuntime {
     //start an SSE connection for presence
     this.disconnectPresence = await this.#startPresenceConnection();
 
-    // Handle SIGTERM to gracefully stop all run controllers
+    // Handle SIGTERM/SIGINT to gracefully stop all run controllers
     process.on("SIGTERM", this.#handleSigterm);
+    process.on("SIGINT", this.#handleSigterm);
+
+    // Spawn detached watchdog to cancel runs if CLI is killed (e.g. pnpm SIGKILL)
+    this.#spawnWatchdog();
 
     //start dequeuing
     await this.#dequeueRuns();
   }
 
   #handleSigterm = async () => {
-    logger.debug("[DevSupervisor] Received SIGTERM, stopping all run controllers");
+    logger.debug("[DevSupervisor] Received SIGTERM/SIGINT, stopping all run controllers");
 
-    const stopPromises = Array.from(this.runControllers.values()).map((controller) =>
-      controller.stop()
-    );
+    await this.shutdown();
 
-    await Promise.allSettled(stopPromises);
+    // Must exit explicitly since registering a custom SIGINT handler
+    // overrides Node's default process termination behavior.
+    process.exit(0);
   };
 
   async shutdown(): Promise<void> {
     process.off("SIGTERM", this.#handleSigterm);
+    process.off("SIGINT", this.#handleSigterm);
+
+    // Stop all local run controllers first so active-runs.json is up-to-date
+    const stopPromises = Array.from(this.runControllers.values()).map((controller) =>
+      controller.stop()
+    );
+    await Promise.allSettled(stopPromises);
+
+    // Kill watchdog on clean shutdown — no disconnect needed since runs are stopped locally
+    this.#killWatchdog();
 
     this.disconnectPresence?.();
     try {
@@ -174,6 +209,116 @@ class DevSupervisor implements WorkerRuntime {
           error: shutdownError,
         });
       }
+    }
+  }
+
+  #spawnWatchdog() {
+    const triggerDir = join(this.options.config.workingDir, ".trigger");
+    if (!existsSync(triggerDir)) {
+      mkdirSync(triggerDir, { recursive: true });
+    }
+
+    // Namespace watchdog state per branch so concurrent dev sessions on
+    // different branches don't share a single watchdog instance (the
+    // single-instance guard would otherwise kill the other branch's watchdog).
+    const safeBranch = devBranchPathSegment(this.options.branch);
+    const suffix = safeBranch ? `-${safeBranch}` : "";
+
+    this.activeRunsPath = join(triggerDir, `active-runs${suffix}.json`);
+    this.watchdogPidPath = join(triggerDir, `watchdog${suffix}.pid`);
+    const lockFilePath = join(triggerDir, safeBranch ? `dev.${safeBranch}.lock` : "dev.lock");
+
+    // Write empty active-runs file
+    this.#updateActiveRunsFile();
+
+    // Resolve the compiled watchdog script path relative to this file
+    const thisDir = fileURLToPath(new URL(".", import.meta.url));
+    const watchdogScript = join(thisDir, "devWatchdog.js");
+
+    if (!existsSync(watchdogScript)) {
+      logger.debug("[DevSupervisor] Watchdog script not found, skipping", { watchdogScript });
+      return;
+    }
+
+    try {
+      this.watchdogProcess = spawn(process.execPath, [watchdogScript], {
+        detached: true,
+        stdio: "ignore",
+        env: {
+          ...process.env,
+          WATCHDOG_PARENT_PID: process.pid.toString(),
+          WATCHDOG_API_URL: this.config?.engineUrl ?? this.options.client.apiURL,
+          WATCHDOG_API_KEY: this.options.client.accessToken ?? "",
+          WATCHDOG_ACTIVE_RUNS: this.activeRunsPath,
+          WATCHDOG_PID_FILE: this.watchdogPidPath,
+          WATCHDOG_TMP_DIR: getTmpRoot(this.options.config.workingDir, this.options.branch),
+          WATCHDOG_LOCK_FILE: lockFilePath,
+        },
+      });
+
+      this.watchdogProcess.unref();
+
+      logger.debug("[DevSupervisor] Spawned watchdog", {
+        watchdogPid: this.watchdogProcess.pid,
+        parentPid: process.pid,
+      });
+    } catch (error) {
+      logger.debug("[DevSupervisor] Failed to spawn watchdog", { error });
+    }
+  }
+
+  #killWatchdog() {
+    const knownPid = this.watchdogProcess?.pid;
+
+    if (knownPid) {
+      try {
+        process.kill(knownPid, "SIGTERM");
+      } catch {
+        // Already dead
+      }
+      this.watchdogProcess = undefined;
+    }
+
+    // Fallback: try via PID file, but only if the PID matches our spawned watchdog
+    // to avoid killing an unrelated process that reused a stale PID
+    if (this.watchdogPidPath) {
+      try {
+        const content = readFileSync(this.watchdogPidPath, "utf8");
+        const prefix = "trigger-watchdog:";
+        if (content.startsWith(prefix)) {
+          const pid = parseInt(content.slice(prefix.length), 10);
+          if (pid && (!knownPid || pid === knownPid)) {
+            process.kill(pid, "SIGTERM");
+          }
+        }
+      } catch {
+        // Already dead or no file
+      }
+    }
+
+    // Clean up files
+    try {
+      if (this.activeRunsPath) unlinkSync(this.activeRunsPath);
+    } catch {}
+    try {
+      if (this.watchdogPidPath) unlinkSync(this.watchdogPidPath);
+    } catch {}
+  }
+
+  #updateActiveRunsFile() {
+    if (!this.activeRunsPath) return;
+
+    try {
+      const data = {
+        parentPid: process.pid,
+        runFriendlyIds: Array.from(this.runControllers.keys()),
+      };
+      // Atomic write: write to temp file then rename to avoid corrupt reads
+      const tmpPath = this.activeRunsPath + ".tmp";
+      writeFileSync(tmpPath, JSON.stringify(data));
+      renameSync(tmpPath, this.activeRunsPath);
+    } catch (error) {
+      logger.debug("[DevSupervisor] Failed to update active-runs file", { error });
     }
   }
 
@@ -206,6 +351,25 @@ class DevSupervisor implements WorkerRuntime {
       throw new Error("Could not initialize worker");
     }
 
+    // Copy registered skill folders into `${workingDir}/.trigger/skills/{id}/`
+    // so `skill.local()` can read them at runtime. The main indexer already
+    // discovered skills; we just do the file IO here.
+    const discoveredSkills = backgroundWorker.manifest.skills ?? [];
+    if (discoveredSkills.length > 0) {
+      try {
+        await copySkillFolders({
+          skills: discoveredSkills,
+          destinationRoot: join(this.options.config.workingDir, ".trigger", "skills"),
+          workingDir: this.options.config.workingDir,
+          logger,
+        });
+      } catch (err) {
+        prettyError("Skill bundling failed", (err as Error).message);
+        stop();
+        return;
+      }
+    }
+
     const validationIssue = validateWorkerManifest(backgroundWorker.manifest);
 
     if (validationIssue) {
@@ -226,6 +390,7 @@ class DevSupervisor implements WorkerRuntime {
         packageVersion: manifest.packageVersion,
         cliPackageVersion: manifest.cliPackageVersion,
         tasks: backgroundWorker.manifest.tasks,
+        prompts: backgroundWorker.manifest.prompts,
         queues: backgroundWorker.manifest.queues,
         contentHash: manifest.contentHash,
         sourceFiles,
@@ -317,7 +482,9 @@ class DevSupervisor implements WorkerRuntime {
             }
           );
 
-          //todo call the API to crash the run with a good message
+          this.#failRunWithMissingWorker(message).catch((error) => {
+            logger.debug("[DevSupervisor] Failed to fail run with missing worker", { error });
+          });
           continue;
         }
 
@@ -386,11 +553,14 @@ class DevSupervisor implements WorkerRuntime {
             //stop the run controller, and remove it
             runController?.stop();
             this.runControllers.delete(message.run.friendlyId);
+            this.#updateActiveRunsFile();
             this.#unsubscribeFromRunNotifications(message.run.friendlyId);
 
             //stop the worker if it is deprecated and there are no more runs
             if (worker.deprecated) {
-              this.#tryDeleteWorker(message.backgroundWorker.friendlyId).finally(() => {});
+              this.#tryDeleteWorker(message.backgroundWorker.friendlyId).catch((err) => {
+                logger.debug("[DevSupervisor] Failed to delete worker", { error: err });
+              });
             }
           },
           onSubscribeToRunNotifications: async (run, snapshot) => {
@@ -402,6 +572,7 @@ class DevSupervisor implements WorkerRuntime {
         });
 
         this.runControllers.set(message.run.friendlyId, runController);
+        this.#updateActiveRunsFile();
 
         if (this.runLimiter) {
           this.runLimiter(() => runController.start(message)).then(() => {
@@ -421,6 +592,33 @@ class DevSupervisor implements WorkerRuntime {
       //dequeue again
       setTimeout(() => this.#dequeueRuns(), this.config.dequeueIntervalWithoutRun);
     }
+  }
+
+  async #failRunWithMissingWorker(message: DequeuedMessage) {
+    const start = await this.options.client.dev.startRunAttempt(
+      message.run.friendlyId,
+      message.snapshot.friendlyId
+    );
+
+    if (!start.success) {
+      return;
+    }
+
+    const { run, snapshot, execution } = start.data;
+
+    await this.options.client.dev.completeRunAttempt(run.friendlyId, snapshot.friendlyId, {
+      completion: {
+        id: execution.run.id,
+        ok: false,
+        retry: undefined,
+        error: {
+          type: "INTERNAL_ERROR",
+          code: TaskRunErrorCodes.COULD_NOT_FIND_EXECUTOR,
+          message:
+            "This run was assigned to a background worker version that is no longer available in the dev session because it was superseded by a rebuild. Trigger the run again to use the current version.",
+        },
+      },
+    });
   }
 
   async #startPresenceConnection() {
@@ -447,6 +645,7 @@ class DevSupervisor implements WorkerRuntime {
         logger.info("[DevSupervisor] Closing presence connection");
         eventSource.close();
       };
+      // eslint-disable-next-line no-useless-catch
     } catch (error) {
       throw error;
     }
@@ -486,7 +685,9 @@ class DevSupervisor implements WorkerRuntime {
       }
 
       existingWorker.deprecate();
-      this.#tryDeleteWorker(workerId).finally(() => {});
+      this.#tryDeleteWorker(workerId).catch((err) => {
+        logger.debug("[DevSupervisor] Failed to delete worker", { error: err });
+      });
     }
 
     this.workers.set(worker.serverWorker.id, worker);
@@ -558,7 +759,7 @@ class DevSupervisor implements WorkerRuntime {
       }
     });
 
-    const interval = setInterval(() => {
+    const _interval = setInterval(() => {
       logger.debug("[DevSupervisor] Socket connections", {
         connections: Array.from(this.socketConnections),
       });
@@ -604,49 +805,101 @@ class DevSupervisor implements WorkerRuntime {
   }
 
   /** Deletes the worker if there are no active runs, after a delay */
+  /**
+   * Maximum number of deprecated workers to keep around.
+   * We retain a small buffer of old workers because the server may still
+   * dequeue runs locked to a recently-deprecated worker version.
+   * When the limit is exceeded, the oldest deprecated workers are cleaned up.
+   */
+  static readonly MAX_DEPRECATED_WORKERS = 2;
+
   async #tryDeleteWorker(friendlyId: string) {
     await awaitTimeout(5_000);
-    this.#deleteWorker(friendlyId);
+    this.#cleanupWorker(friendlyId);
   }
 
-  #deleteWorker(friendlyId: string) {
-    logger.debug("[DevSupervisor] Delete worker (if relevant)", {
-      workerId: friendlyId,
-    });
+  #hasActiveRunsForWorker(friendlyId: string): boolean {
+    for (const controller of this.runControllers.values()) {
+      try {
+        if (controller.workerFriendlyId === friendlyId) return true;
+      } catch {
+        // workerFriendlyId may throw if the controller is in an unexpected state
+      }
+    }
+    return false;
+  }
 
+  #cleanupWorker(friendlyId: string) {
     const worker = this.workers.get(friendlyId);
     if (!worker) {
+      return;
+    }
+
+    if (this.#hasActiveRunsForWorker(friendlyId)) {
+      logger.debug("[DevSupervisor] Worker still has active runs, skipping cleanup", {
+        workerId: friendlyId,
+      });
       return;
     }
 
     if (worker.serverWorker?.version) {
       this.taskRunProcessPool?.deprecateVersion(worker.serverWorker?.version);
     }
+
+    // Enforce limit on deprecated workers to bound disk usage.
+    // We keep a few around because the server may still dequeue runs for them.
+    this.#pruneDeprecatedWorkers();
+  }
+
+  #pruneDeprecatedWorkers() {
+    const deprecatedWorkers: Array<{ id: string; worker: BackgroundWorker }> = [];
+
+    for (const [id, worker] of this.workers.entries()) {
+      if (!worker.deprecated) continue;
+
+      if (!this.#hasActiveRunsForWorker(id)) {
+        deprecatedWorkers.push({ id, worker });
+      }
+    }
+
+    // Keep the most recent deprecated workers, remove the rest
+    if (deprecatedWorkers.length <= DevSupervisor.MAX_DEPRECATED_WORKERS) {
+      return;
+    }
+
+    // Remove oldest first (they appear first in insertion order of the Map)
+    const toRemove = deprecatedWorkers.slice(
+      0,
+      deprecatedWorkers.length - DevSupervisor.MAX_DEPRECATED_WORKERS
+    );
+
+    for (const { id, worker } of toRemove) {
+      logger.debug("[DevSupervisor] Pruning old deprecated worker and cleaning up build dir", {
+        workerId: id,
+        version: worker.serverWorker?.version,
+      });
+
+      if (worker.serverWorker?.version) {
+        this.taskRunProcessPool?.deprecateVersion(worker.serverWorker.version);
+      }
+
+      worker.stop();
+      this.workers.delete(id);
+    }
   }
 }
 
-type ValidationIssue =
-  | {
-      type: "duplicateTaskId";
-      duplicationTaskIds: string[];
-    }
-  | {
-      type: "noTasksDefined";
-    };
+type ValidationIssue = {
+  type: "noTasksDefined";
+};
 
+// Duplicate task ids (including across task types, e.g. a schedule and a
+// regular task sharing an id) are enforced server-side when the background
+// worker is registered, so both `dev` and `deploy` surface a single,
+// authoritative error from the backend rather than a separate client check.
 function validateWorkerManifest(manifest: WorkerManifest): ValidationIssue | undefined {
-  const issues: ValidationIssue[] = [];
-
   if (!manifest.tasks || manifest.tasks.length === 0) {
     return { type: "noTasksDefined" };
-  }
-
-  // Check for any duplicate task ids
-  const taskIds = manifest.tasks.map((task) => task.id);
-  const duplicateTaskIds = taskIds.filter((id, index) => taskIds.indexOf(id) !== index);
-
-  if (duplicateTaskIds.length > 0) {
-    return { type: "duplicateTaskId", duplicationTaskIds: duplicateTaskIds };
   }
 
   return undefined;
@@ -654,9 +907,6 @@ function validateWorkerManifest(manifest: WorkerManifest): ValidationIssue | und
 
 function generationValidationIssueHeader(issue: ValidationIssue) {
   switch (issue.type) {
-    case "duplicateTaskId": {
-      return `Duplicate task ids detected`;
-    }
     case "noTasksDefined": {
       return `No tasks exported from your trigger files`;
     }
@@ -665,9 +915,6 @@ function generationValidationIssueHeader(issue: ValidationIssue) {
 
 function generateValidationIssueFooter(issue: ValidationIssue) {
   switch (issue.type) {
-    case "duplicateTaskId": {
-      return cliLink("View the task docs", "https://trigger.dev/docs/tasks/overview");
-    }
     case "noTasksDefined": {
       return cliLink("View the task docs", "https://trigger.dev/docs/tasks/overview");
     }
@@ -680,9 +927,6 @@ function generateValidationIssueMessage(
   buildManifest: BuildManifest
 ) {
   switch (issue.type) {
-    case "duplicateTaskId": {
-      return createDuplicateTaskIdOutputErrorMessage(issue.duplicationTaskIds, manifest.tasks);
-    }
     case "noTasksDefined": {
       return `
         Files:
@@ -705,21 +949,4 @@ function generateValidationIssueMessage(
       return `Unknown validation issue: ${issue}`;
     }
   }
-}
-
-function createDuplicateTaskIdOutputErrorMessage(
-  duplicateTaskIds: Array<string>,
-  tasks: Array<TaskManifest>
-) {
-  const duplicateTable = duplicateTaskIds
-    .map((id) => {
-      const $tasks = tasks.filter((task) => task.id === id);
-
-      return `\n\n${chalkTask(id)} was found in:${tasks
-        .map((task) => `\n${task.filePath} -> ${task.exportName}`)
-        .join("")}`;
-    })
-    .join("");
-
-  return `Duplicate ${chalkTask("task id")} detected:${duplicateTable}`;
 }

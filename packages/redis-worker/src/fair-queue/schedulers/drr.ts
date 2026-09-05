@@ -1,7 +1,8 @@
-import { createRedisClient, type Redis, type RedisOptions } from "@internal/redis";
+import { createRedisClient, type Redis } from "@internal/redis";
 import { BaseScheduler } from "../scheduler.js";
 import type {
   DRRSchedulerConfig,
+  DispatchSchedulerContext,
   FairQueueKeyProducer,
   SchedulerContext,
   TenantQueues,
@@ -102,9 +103,7 @@ export class DRRScheduler extends BaseScheduler {
     );
 
     // Filter out tenants at capacity or with no deficit
-    const eligibleTenants = tenantData.filter(
-      (t) => !t.isAtCapacity && t.deficit >= 1
-    );
+    const eligibleTenants = tenantData.filter((t) => !t.isAtCapacity && t.deficit >= 1);
 
     // Log tenants blocked by capacity
     const blockedTenants = tenantData.filter((t) => t.isAtCapacity);
@@ -130,6 +129,70 @@ export class DRRScheduler extends BaseScheduler {
       tenantId: t.tenantId,
       queues: t.queues,
     }));
+  }
+
+  /**
+   * Select queues using the two-level tenant dispatch index.
+   *
+   * Algorithm:
+   * 1. ZRANGEBYSCORE on dispatch index (gets only tenants with queues - much smaller)
+   * 2. Add quantum to each tenant's deficit (atomically)
+   * 3. Check capacity as safety net (dispatch should only have tenants with capacity)
+   * 4. Select tenants with deficit >= 1, sorted by deficit (highest first)
+   * 5. For each tenant, fetch their queues from Level 2 index
+   */
+  async selectQueuesFromDispatch(
+    dispatchShardKey: string,
+    consumerId: string,
+    context: DispatchSchedulerContext
+  ): Promise<TenantQueues[]> {
+    // Level 1: Get tenants from dispatch index
+    const tenants = await this.#getTenantsFromDispatch(dispatchShardKey);
+
+    if (tenants.length === 0) {
+      return [];
+    }
+
+    const tenantIds = tenants.map((t) => t.tenantId);
+
+    // Add quantum to all active tenants atomically (1 Lua call)
+    const deficits = await this.#addQuantumToTenants(tenantIds);
+
+    // Build candidates sorted by deficit (highest first)
+    const candidates = tenantIds
+      .map((tenantId, index) => ({ tenantId, deficit: deficits[index] ?? 0 }))
+      .filter((t) => t.deficit >= 1);
+
+    candidates.sort((a, b) => b.deficit - a.deficit);
+
+    // Pick the first tenant with available capacity and fetch their queues.
+    // This keeps the scheduler cheap: O(1) in the common case where the
+    // highest-deficit tenant has capacity. The consumer loop iterates fast
+    // (1ms yield between rounds) so we cycle through tenants quickly.
+    for (const { tenantId, deficit } of candidates) {
+      const isAtCapacity = await context.isAtCapacity("tenant", tenantId);
+      if (isAtCapacity) continue;
+
+      // Limit queues fetched to what the tenant can actually process this round.
+      // deficit = max messages this tenant should process, so no point fetching
+      // more queues than that (each queue yields at least 1 message).
+      const queueLimit = Math.ceil(deficit);
+      const queues = await context.getQueuesForTenant(tenantId, queueLimit);
+      if (queues.length > 0) {
+        this.logger.debug("DRR dispatch: selected tenant", {
+          dispatchTenants: tenants.length,
+          candidates: candidates.length,
+          selectedTenant: tenantId,
+          deficit,
+          queueLimit,
+          queuesReturned: queues.length,
+        });
+
+        return [{ tenantId, queues: queues.map((q) => q.queueId) }];
+      }
+    }
+
+    return [];
   }
 
   /**
@@ -198,6 +261,35 @@ export class DRRScheduler extends BaseScheduler {
   #deficitKey(): string {
     // Use a fixed key for DRR deficit tracking
     return `${this.keys.masterQueueKey(0).split(":")[0]}:drr:deficit`;
+  }
+
+  async #getTenantsFromDispatch(
+    dispatchKey: string
+  ): Promise<Array<{ tenantId: string; score: number }>> {
+    const now = Date.now();
+    const results = await this.redis.zrangebyscore(
+      dispatchKey,
+      "-inf",
+      now,
+      "WITHSCORES",
+      "LIMIT",
+      0,
+      this.masterQueueLimit
+    );
+
+    const tenants: Array<{ tenantId: string; score: number }> = [];
+    for (let i = 0; i < results.length; i += 2) {
+      const tenantId = results[i];
+      const scoreStr = results[i + 1];
+      if (tenantId && scoreStr) {
+        tenants.push({
+          tenantId,
+          score: parseFloat(scoreStr),
+        });
+      }
+    }
+
+    return tenants;
   }
 
   async #getQueuesFromShard(shardKey: string): Promise<QueueWithScore[]> {
@@ -357,11 +449,6 @@ declare module "@internal/redis" {
 
     drrDecrementDeficit(deficitKey: string, tenantId: string): Promise<string>;
 
-    drrDecrementDeficitBatch(
-      deficitKey: string,
-      tenantId: string,
-      count: string
-    ): Promise<string>;
+    drrDecrementDeficitBatch(deficitKey: string, tenantId: string, count: string): Promise<string>;
   }
 }
-

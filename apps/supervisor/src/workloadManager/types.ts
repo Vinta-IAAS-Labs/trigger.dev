@@ -1,4 +1,9 @@
-import type { EnvironmentType, MachinePreset, PlacementTag } from "@trigger.dev/core/v3";
+import type {
+  EnvironmentType,
+  MachinePreset,
+  PlacementTag,
+  RunAnnotations,
+} from "@trigger.dev/core/v3";
 
 export interface WorkloadManagerOptions {
   workloadApiProtocol: "http" | "https";
@@ -11,6 +16,8 @@ export interface WorkloadManagerOptions {
   snapshotPollIntervalSeconds?: number;
   additionalEnvVars?: Record<string, string>;
   dockerAutoremove?: boolean;
+  // Whether CRIU checkpoint/restore is enabled for this deployment
+  checkpointsEnabled?: boolean;
 }
 
 export interface WorkloadManager {
@@ -24,6 +31,10 @@ export interface WorkloadManagerCreateOptions {
   nextAttemptNumber?: number;
   dequeuedAt: Date;
   placementTags?: PlacementTag[];
+  // Timing context (populated by supervisor handler, included in wide event)
+  dequeueResponseMs?: number;
+  pollingIntervalMs?: number;
+  warmStartCheckMs?: number;
   // identifiers
   envId: string;
   envType: EnvironmentType;
@@ -31,8 +42,17 @@ export interface WorkloadManagerCreateOptions {
   projectId: string;
   deploymentFriendlyId: string;
   deploymentVersion: string;
+  // Canonical runtime identifier (e.g. "node", "node-22", "node-24")
+  runtime?: string;
+  // When set, overrides the TRIGGER_DEPLOYMENT_ID value the runner forwards as its identity header.
+  deploymentToken?: string;
   runId: string;
   runFriendlyId: string;
   snapshotId: string;
   snapshotFriendlyId: string;
+  // Trace context for OTel span emission (W3C format: { traceparent: "00-...", tracestate?: "..." })
+  traceContext?: Record<string, unknown>;
+  annotations?: RunAnnotations;
+  // private networking
+  hasPrivateLink?: boolean;
 }

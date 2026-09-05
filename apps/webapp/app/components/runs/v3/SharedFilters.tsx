@@ -1,5 +1,4 @@
 import * as Ariakit from "@ariakit/react";
-import type { RuntimeEnvironment } from "@trigger.dev/database";
 import {
   endOfDay,
   endOfMonth,
@@ -11,19 +10,22 @@ import {
   subWeeks,
 } from "date-fns";
 import parse from "parse-duration";
-import { startTransition, useCallback, useEffect, useState, type ReactNode } from "react";
+import { type ReactNode, startTransition, useCallback, useEffect, useRef, useState } from "react";
 import simplur from "simplur";
 import { AppliedFilter } from "~/components/primitives/AppliedFilter";
 import { Callout } from "~/components/primitives/Callout";
 import { DateTime } from "~/components/primitives/DateTime";
 import { DateTimePicker } from "~/components/primitives/DateTimePicker";
+import { FormError } from "~/components/primitives/FormError";
+import { Input } from "~/components/primitives/Input";
 import { Label } from "~/components/primitives/Label";
 import { Paragraph } from "~/components/primitives/Paragraph";
 import { RadioButtonCircle } from "~/components/primitives/RadioButton";
 import { ComboboxProvider, SelectPopover, SelectProvider } from "~/components/primitives/Select";
+import { ShortcutKey } from "~/components/primitives/ShortcutKey";
 import { useOptionalOrganization } from "~/hooks/useOrganizations";
 import { useSearchParams } from "~/hooks/useSearchParam";
-import { type ShortcutDefinition } from "~/hooks/useShortcutKeys";
+import { type ShortcutDefinition, useShortcutKeys } from "~/hooks/useShortcutKeys";
 import { cn } from "~/utils/cn";
 import { organizationBillingPath } from "~/utils/pathBuilder";
 import { Button, LinkButton } from "../../primitives/Buttons";
@@ -326,8 +328,8 @@ export function timeFilterRenderValues({
     rangeType === "range" || rangeType === "period"
       ? labelName
       : rangeType === "from"
-      ? `${labelName} after`
-      : `${labelName} before`;
+        ? `${labelName} after`
+        : `${labelName} before`;
 
   return { label, valueLabel, rangeType };
 }
@@ -347,6 +349,8 @@ export interface TimeFilterProps {
   /** Label name used in the filter display, defaults to "Created" */
   labelName?: string;
   hideLabel?: boolean;
+  /** Keyboard shortcut to open the dropdown */
+  shortcut?: ShortcutDefinition;
   applyShortcut?: ShortcutDefinition | undefined;
   /** Callback when the user applies a time filter selection, receives the applied values */
   onValueChange?: (values: TimeFilterApplyValues) => void;
@@ -354,6 +358,8 @@ export interface TimeFilterProps {
   maxPeriodDays?: number;
   /** Optional className override for the value text in the filter pill */
   valueClassName?: string;
+  /** Extra URL params to clear when the range changes, in addition to the default cursor/direction (e.g. a page's namespaced pagination params). */
+  clearParams?: string[];
 }
 
 export function TimeFilter({
@@ -363,15 +369,31 @@ export function TimeFilter({
   to,
   labelName = "Created",
   hideLabel = false,
+  shortcut,
   applyShortcut,
   onValueChange,
   maxPeriodDays,
   valueClassName,
+  clearParams,
 }: TimeFilterProps = {}) {
   const { value } = useSearchParams();
-  const periodValue = period ?? value("period");
-  const fromValue = from ?? value("from");
-  const toValue = to ?? value("to");
+  // In controlled mode (onValueChange provided) the caller owns all three values via local
+  // state, so don't fall back to the URL — otherwise selecting a custom date range (which
+  // sets period to undefined) would read the page-level URL period and override the range.
+  const controlled = onValueChange !== undefined;
+  const periodValue = controlled ? period : (period ?? value("period"));
+  const fromValue = controlled ? from : (from ?? value("from"));
+  const toValue = controlled ? to : (to ?? value("to"));
+  const triggerRef = useRef<HTMLButtonElement>(null);
+
+  useShortcutKeys({
+    shortcut,
+    action: (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      triggerRef.current?.click();
+    },
+  });
 
   const constrained = timeFilters({
     period: periodValue,
@@ -386,16 +408,33 @@ export function TimeFilter({
       {() => (
         <TimeDropdown
           trigger={
-            <Ariakit.Select render={<div className="group cursor-pointer focus-custom" />}>
-              <AppliedFilter
-                label={hideLabel ? undefined : constrained.label}
-                icon={filterIcon("period")}
-                value={constrained.valueLabel}
-                removable={false}
-                variant="secondary/small"
-                valueClassName={valueClassName}
-              />
-            </Ariakit.Select>
+            <Ariakit.TooltipProvider timeout={200}>
+              <Ariakit.TooltipAnchor
+                render={
+                  <Ariakit.Select
+                    ref={triggerRef}
+                    render={<div className="group cursor-pointer focus-custom" />}
+                  />
+                }
+              >
+                <AppliedFilter
+                  label={hideLabel ? undefined : constrained.label}
+                  icon={filterIcon("period")}
+                  value={constrained.valueLabel}
+                  removable={false}
+                  variant="secondary/small"
+                  valueClassName={valueClassName}
+                />
+              </Ariakit.TooltipAnchor>
+              {shortcut && (
+                <Ariakit.Tooltip className="z-40 cursor-default rounded border border-grid-bright bg-background-bright px-2 py-1.5 text-xs">
+                  <div className="flex items-center gap-2">
+                    <span>Filter by time period</span>
+                    <ShortcutKey className="size-4 flex-none" shortcut={shortcut} variant="small" />
+                  </div>
+                </Ariakit.Tooltip>
+              )}
+            </Ariakit.TooltipProvider>
           }
           period={constrained.period}
           from={constrained.from}
@@ -405,6 +444,7 @@ export function TimeFilter({
           applyShortcut={applyShortcut}
           onValueChange={onValueChange}
           maxPeriodDays={maxPeriodDays}
+          clearParams={clearParams}
         />
       )}
     </FilterMenuProvider>
@@ -424,7 +464,7 @@ function getInitialCustomDuration(period?: string): { value: string; unit: strin
 
 type SectionType = "duration" | "dateRange";
 
-export function TimeDropdown({
+function TimeDropdown({
   trigger,
   period,
   from,
@@ -435,6 +475,7 @@ export function TimeDropdown({
   onApply,
   onValueChange,
   maxPeriodDays,
+  clearParams,
 }: {
   trigger: ReactNode;
   period?: string;
@@ -448,6 +489,8 @@ export function TimeDropdown({
   onValueChange?: (values: TimeFilterApplyValues) => void;
   /** When set an upgrade message will be shown if you select a period further back than this number of days */
   maxPeriodDays?: number;
+  /** Extra URL params to clear on apply, alongside the default cursor/direction. */
+  clearParams?: string[];
 }) {
   const organization = useOptionalOrganization();
   const [open, setOpen] = useState<boolean | undefined>();
@@ -466,7 +509,7 @@ export function TimeDropdown({
   const isInitialCustom =
     period && !timePeriods.some((p) => p.value === period) && initialCustom.value !== "";
   const [selectedPeriod, setSelectedPeriod] = useState<string>(
-    isInitialCustom ? "custom" : period ?? defaultPeriod
+    isInitialCustom ? "custom" : (period ?? defaultPeriod)
   );
 
   // Custom duration state
@@ -476,11 +519,12 @@ export function TimeDropdown({
   // Sync state when props change
   useEffect(() => {
     const parsed = getInitialCustomDuration(period);
+    // oxlint-disable-next-line react/set-state-in-effect -- This effect intentionally synchronizes local state after an external or lifecycle change.
     setCustomValue(parsed.value);
     setCustomUnit(parsed.unit);
 
     const isCustom = period && !timePeriods.some((p) => p.value === period) && parsed.value !== "";
-    setSelectedPeriod(isCustom ? "custom" : period ?? defaultPeriod);
+    setSelectedPeriod(isCustom ? "custom" : (period ?? defaultPeriod));
     setActiveSection(from || to ? "dateRange" : "duration");
   }, [period, from, to, defaultPeriod]);
 
@@ -525,6 +569,7 @@ export function TimeDropdown({
         onValueChange(values);
       } else {
         replace({
+          ...Object.fromEntries((clearParams ?? []).map((key) => [key, undefined])),
           period: periodToApply,
           cursor: undefined,
           direction: undefined,
@@ -538,7 +583,7 @@ export function TimeDropdown({
       setOpen(false);
       onApply?.(values);
     },
-    [maxPeriodDays, onValueChange, replace, onApply]
+    [clearParams, maxPeriodDays, onValueChange, replace, onApply]
   );
 
   const applySelection = useCallback(() => {
@@ -584,6 +629,7 @@ export function TimeDropdown({
       } else {
         // URL mode - navigate
         replace({
+          ...Object.fromEntries((clearParams ?? []).map((key) => [key, undefined])),
           period: undefined,
           cursor: undefined,
           direction: undefined,
@@ -597,6 +643,7 @@ export function TimeDropdown({
     }
   }, [
     activeSection,
+    clearParams,
     selectedPeriod,
     isCustomDurationValid,
     customValue,
@@ -622,16 +669,18 @@ export function TimeDropdown({
       >
         <div className="flex flex-col gap-4 p-3">
           {/* Duration section */}
-          <div
-            onClick={() => {
-              setActiveSection("duration");
-              setValidationError(null);
-              setSelectedQuickDate(null);
-            }}
-            className="flex cursor-pointer gap-3 rounded-md pb-3"
-          >
-            <RadioButtonCircle checked={activeSection === "duration"} />
-            <div className="flex flex-1 flex-col gap-1">
+          <div className="flex flex-col rounded-md pb-3">
+            <button
+              type="button"
+              aria-pressed={activeSection === "duration"}
+              onClick={() => {
+                setActiveSection("duration");
+                setValidationError(null);
+                setSelectedQuickDate(null);
+              }}
+              className="flex w-full cursor-pointer gap-3 text-left focus-custom"
+            >
+              <RadioButtonCircle checked={activeSection === "duration"} />
               <Label
                 className={cn(
                   "mb-2 transition-colors",
@@ -640,20 +689,21 @@ export function TimeDropdown({
               >
                 {labelName} in the last
               </Label>
+            </button>
+            <div className="ml-8 flex flex-1 flex-col gap-1">
               <div className="grid grid-cols-4 gap-2">
                 {/* Custom duration row */}
                 <div
                   className={cn(
-                    "col-span-4 flex h-[1.8rem] w-full items-center gap-2 rounded border bg-charcoal-750 py-0.5 pl-0 pr-2 transition-colors",
+                    "col-span-4 flex h-[1.8rem] w-full items-center gap-2 rounded border bg-background-hover py-0.5 pl-0 pr-2 transition-colors",
                     activeSection === "duration" && selectedPeriod === "custom"
                       ? "border-indigo-500 "
-                      : "border-charcoal-650 hover:border-charcoal-600",
+                      : "border-border-bright hover:border-border-bright",
                     validationError &&
                       activeSection === "duration" &&
                       selectedPeriod === "custom" &&
                       "border-error"
                   )}
-                  onClick={(e) => e.stopPropagation()}
                 >
                   <input
                     type="number"
@@ -673,7 +723,7 @@ export function TimeDropdown({
                       setActiveSection("duration");
                       setValidationError(null);
                     }}
-                    className="h-full w-full translate-y-px border-none bg-transparent py-0 pl-2 pr-0 text-xs leading-none text-text-bright outline-none placeholder:text-text-dimmed focus:outline-none focus:ring-0 [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                    className="h-full w-full translate-y-px border-none bg-transparent py-0 pl-2 pr-0 text-xs leading-none text-text-bright outline-hidden placeholder:text-text-dimmed focus:outline-hidden focus:ring-0 [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
                   />
                   <div className="flex items-center gap-2">
                     {timeUnits.map((unit) => (
@@ -736,15 +786,17 @@ export function TimeDropdown({
           </div>
 
           {/* Date range section */}
-          <div
-            onClick={() => {
-              setActiveSection("dateRange");
-              setValidationError(null);
-            }}
-            className="flex cursor-pointer gap-3"
-          >
-            <RadioButtonCircle checked={activeSection === "dateRange"} />
-            <div className="flex flex-1 flex-col">
+          <div className="flex flex-col">
+            <button
+              type="button"
+              aria-pressed={activeSection === "dateRange"}
+              onClick={() => {
+                setActiveSection("dateRange");
+                setValidationError(null);
+              }}
+              className="flex w-full cursor-pointer gap-3 text-left focus-custom"
+            >
+              <RadioButtonCircle checked={activeSection === "dateRange"} />
               <Label
                 className={cn(
                   "mb-3 transition-colors",
@@ -761,7 +813,9 @@ export function TimeDropdown({
                   (in local time)
                 </span>
               </Label>
-              <div className="-ml-8 mb-2" onClick={(e) => e.stopPropagation()}>
+            </button>
+            <div className="ml-8 flex flex-1 flex-col">
+              <div className="-ml-8 mb-2">
                 <DateTimePicker
                   label="From"
                   value={fromValue}
@@ -777,7 +831,7 @@ export function TimeDropdown({
                   showInlineLabel
                 />
               </div>
-              <div onClick={(e) => e.stopPropagation()} className="-ml-8">
+              <div className="-ml-8">
                 <DateTimePicker
                   label="To"
                   value={toValue}
@@ -794,7 +848,7 @@ export function TimeDropdown({
                 />
               </div>
               {/* Quick select date ranges */}
-              <div className="mt-2 grid grid-cols-2 gap-2" onClick={(e) => e.stopPropagation()}>
+              <div className="mt-2 grid grid-cols-2 gap-2">
                 <QuickDateButton
                   label="Yesterday"
                   isActive={selectedQuickDate === "yesterday"}
@@ -820,7 +874,7 @@ export function TimeDropdown({
                   }}
                 />
               </div>
-              <div className="mt-2 grid grid-cols-3 gap-2" onClick={(e) => e.stopPropagation()}>
+              <div className="mt-2 grid grid-cols-3 gap-2">
                 <QuickDateButton
                   label="This week"
                   isActive={selectedQuickDate === "thisWeek"}
@@ -968,5 +1022,104 @@ function QuickDateButton({
     >
       {label}
     </Button>
+  );
+}
+
+export type IdFilterDropdownProps = {
+  trigger: ReactNode;
+  clearSearchValue: () => void;
+  searchValue: string;
+  onClose?: () => void;
+  label: string;
+  placeholder: string;
+  paramKey: string;
+  validate?: (value: string) => string | undefined;
+  inputWidth?: string;
+};
+
+export function IdFilterDropdown({
+  trigger,
+  clearSearchValue,
+  onClose,
+  label,
+  placeholder,
+  paramKey,
+  validate,
+  inputWidth = "w-[29ch]",
+}: IdFilterDropdownProps) {
+  const [open, setOpen] = useState<boolean | undefined>();
+  const { value, replace } = useSearchParams();
+  const currentValue = value(paramKey);
+
+  const [inputValue, setInputValue] = useState(currentValue);
+  const [prevOpen, setPrevOpen] = useState(open);
+  if (open !== prevOpen) {
+    setPrevOpen(open);
+    if (open) setInputValue(currentValue);
+  }
+
+  const apply = () => {
+    clearSearchValue();
+    replace({
+      cursor: undefined,
+      direction: undefined,
+      [paramKey]: inputValue === "" ? undefined : inputValue?.toString(),
+    });
+
+    setOpen(false);
+  };
+
+  const error = inputValue ? validate?.(inputValue) : undefined;
+
+  return (
+    <SelectProvider virtualFocus={true} open={open} setOpen={setOpen}>
+      {trigger}
+      <SelectPopover
+        hideOnEnter={false}
+        hideOnEscape={() => {
+          if (onClose) {
+            onClose();
+            return false;
+          }
+
+          return true;
+        }}
+        className="max-w-[min(32ch,var(--popover-available-width))]"
+      >
+        <div className="flex flex-col gap-3 p-3 pt-2">
+          <div className="flex flex-col gap-1">
+            <Paragraph variant="extra-small/bright" className="mb-0.5">
+              {label}
+            </Paragraph>
+            <Input
+              placeholder={placeholder}
+              value={inputValue ?? ""}
+              onChange={(e) => setInputValue(e.target.value)}
+              variant="small"
+              className={cn(inputWidth, "font-mono")}
+              spellCheck={false}
+            />
+            {error ? <FormError>{error}</FormError> : null}
+          </div>
+          <div className="flex justify-between gap-1">
+            <Button variant="secondary/small" onClick={() => setOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              disabled={error !== undefined || !inputValue}
+              variant="secondary/small"
+              shortcut={{
+                modifiers: ["mod"],
+                key: "Enter",
+                enabledOnInputElements: true,
+              }}
+              onClick={() => apply()}
+            >
+              Apply
+            </Button>
+          </div>
+        </div>
+      </SelectPopover>
+    </SelectProvider>
   );
 }

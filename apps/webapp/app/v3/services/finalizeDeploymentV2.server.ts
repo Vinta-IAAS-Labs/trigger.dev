@@ -15,6 +15,8 @@ import { remoteBuildsEnabled } from "../remoteImageBuilder.server";
 import { getEcrAuthToken, isEcrRegistry } from "../getDeploymentImageRef.server";
 import { tryCatch } from "@trigger.dev/core";
 import { getRegistryConfig, type RegistryConfig } from "../registryConfig.server";
+import { ComputeTemplateCreationService } from "./computeTemplateCreation.server";
+import { ecrImageExists } from "./verifyDeploymentImage.server";
 
 export class FinalizeDeploymentV2Service extends BaseService {
   public async call(
@@ -23,12 +25,6 @@ export class FinalizeDeploymentV2Service extends BaseService {
     body: FinalizeDeploymentRequestBody,
     writer?: WritableStreamDefaultWriter
   ) {
-    // If remote builds are not enabled, lets just use the v1 finalize deployment service
-    if (!remoteBuildsEnabled()) {
-      const finalizeService = new FinalizeDeploymentService();
-      return finalizeService.call(authenticatedEnv, id, body);
-    }
-
     const deployment = await this._prisma.workerDeployment.findFirst({
       where: {
         friendlyId: id,
@@ -62,7 +58,6 @@ export class FinalizeDeploymentV2Service extends BaseService {
 
     if (deployment.status === "DEPLOYED") {
       logger.debug("Worker deployment is already deployed", { id });
-
       return deployment;
     }
 
@@ -73,11 +68,21 @@ export class FinalizeDeploymentV2Service extends BaseService {
 
     const finalizeService = new FinalizeDeploymentService();
 
-    if (body.skipPushToRegistry) {
-      logger.debug("Skipping push to registry during deployment finalization", {
-        deployment,
-      });
-      return await finalizeService.call(authenticatedEnv, id, body);
+    // If remote builds are not enabled, skip image push and go straight to template + finalize
+    if (!remoteBuildsEnabled() || body.skipPushToRegistry) {
+      if (body.skipPushToRegistry) {
+        logger.debug("Skipping push to registry during deployment finalization", {
+          deployment,
+        });
+      }
+
+      // The CLI claims the image is already in the registry (local build, or a
+      // self-hosted setup). Verify before promoting so we never mark a
+      // deployment DEPLOYED when nothing was actually pushed.
+      await this.#assertImagePullable(deployment, body);
+
+      await this.#createTemplateIfNeeded(deployment, id, authenticatedEnv, writer);
+      return finalizeService.call(authenticatedEnv, id, body);
     }
 
     const externalBuildData = deployment.externalBuildData
@@ -143,9 +148,78 @@ export class FinalizeDeploymentV2Service extends BaseService {
       pushedImage: pushResult.image,
     });
 
-    const finalizedDeployment = await finalizeService.call(authenticatedEnv, id, body);
+    // Belt and suspenders: confirm the push actually landed before promoting.
+    await this.#assertImagePullable(deployment, body);
 
-    return finalizedDeployment;
+    await this.#createTemplateIfNeeded(deployment, id, authenticatedEnv, writer);
+    return finalizeService.call(authenticatedEnv, id, body);
+  }
+
+  async #assertImagePullable(
+    deployment: { imageReference: string | null; type: string | null },
+    body: FinalizeDeploymentRequestBody
+  ): Promise<void> {
+    if (!env.DEPLOY_IMAGE_VERIFICATION_ENABLED) {
+      return;
+    }
+
+    if (!deployment.imageReference) {
+      return;
+    }
+
+    const registryConfig = getRegistryConfig(deployment.type === "MANAGED");
+
+    // ECR-only: non-ECR (self-hosted) registries can't be checked this way, so skip.
+    if (!isEcrRegistry(registryConfig.host)) {
+      return;
+    }
+
+    const result = await ecrImageExists({
+      imageReference: deployment.imageReference,
+      imageDigest: body.imageDigest,
+      registryConfig,
+    });
+
+    if (result === "missing") {
+      throw new ServiceValidationError(
+        "Deployment image was not found in the registry. It may not have been pushed (for example a local build without a push, or a push to a different registry). Aborting the deploy to avoid promoting a version that cannot start."
+      );
+    }
+
+    if (result === "nonconformant") {
+      throw new ServiceValidationError(
+        "Deployment image is not runnable: it contains zstd-compressed layers inside a Docker (v2s2) manifest, which the container runtime cannot pull. This typically comes from an outdated CLI version. Please upgrade to the latest trigger.dev CLI and re-deploy."
+      );
+    }
+
+    // Fail closed: if we can't confirm the image is present, don't promote a version
+    // that might not start. Set DEPLOY_IMAGE_VERIFICATION_ENABLED=0 for out-of-band pushes.
+    if (result === "unknown") {
+      throw new ServiceValidationError(
+        "Could not verify the deployment image exists in the registry. Aborting the deploy."
+      );
+    }
+  }
+
+  async #createTemplateIfNeeded(
+    deployment: { imageReference: string | null; worker: { project: { id: string } } | null },
+    deploymentFriendlyId: string,
+    authenticatedEnv: AuthenticatedEnvironment,
+    writer?: WritableStreamDefaultWriter
+  ): Promise<void> {
+    if (!deployment.imageReference || !deployment.worker) {
+      return;
+    }
+
+    const templateService = new ComputeTemplateCreationService();
+    await templateService.handleDeployTemplate({
+      projectId: deployment.worker.project.id,
+      imageReference: deployment.imageReference,
+      deploymentFriendlyId,
+      authenticatedEnv,
+      prisma: this._prisma,
+      writer,
+    });
   }
 }
 

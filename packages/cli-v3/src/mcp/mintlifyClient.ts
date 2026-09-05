@@ -1,5 +1,5 @@
 export async function performSearch(query: string, signal: AbortSignal) {
-  const body = callToolBody("SearchTriggerDev", { query });
+  const body = callToolBody("search_trigger_dev", { query });
 
   const response = await fetch("https://trigger.dev/docs/mcp", {
     method: "POST",
@@ -58,6 +58,7 @@ async function parseSSEResponse(response: Response) {
     }
   }
 
+  // eslint-disable-next-line no-unreachable
   throw new Error("No data: event found");
 }
 

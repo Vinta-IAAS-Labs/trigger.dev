@@ -1,4 +1,4 @@
-import { RuntimeEnvironmentType } from "@trigger.dev/database";
+import type { RuntimeEnvironmentType } from "@trigger.dev/database";
 import { z } from "zod";
 
 export const EnvironmentVariableKey = z
@@ -6,7 +6,7 @@ export const EnvironmentVariableKey = z
   .nonempty("Key is required")
   .regex(/^\w+$/, "Keys can only use alphanumeric characters and underscores");
 
-export const EnvironmentVariableUpdaterSchema = z.discriminatedUnion("type", [
+const EnvironmentVariableUpdaterSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("user"),
     userId: z.string(),
@@ -107,6 +107,14 @@ export interface Repository {
   editValue(projectId: string, options: EditEnvironmentVariableValue): Promise<Result>;
   getProject(projectId: string): Promise<ProjectEnvironmentVariable[]>;
   /**
+   * Fetch and decrypt only the given env var values (for dashboard display of non-secret rows).
+   * Map keys are `${environmentId}:${variableKey}`.
+   */
+  getVariableValuesForKeys(
+    projectId: string,
+    items: Array<{ environmentId: string; key: string }>
+  ): Promise<Map<string, string>>;
+  /**
    * Get the environment variables for a given environment, it does NOT return values for secret variables
    */
   getEnvironmentWithRedactedSecrets(
@@ -120,7 +128,12 @@ export interface Repository {
   /**
    * Return all env vars, including secret variables with values. Should only be used for executing tasks.
    */
-  getEnvironmentVariables(projectId: string, environmentId: string): Promise<EnvironmentVariable[]>;
+  getEnvironmentVariables(
+    projectId: string,
+    environmentId: string,
+    parentEnvironmentId?: string,
+    options?: { readFromReplica?: boolean }
+  ): Promise<EnvironmentVariable[]>;
   delete(projectId: string, options: DeleteEnvironmentVariable): Promise<Result>;
   deleteValue(projectId: string, options: DeleteEnvironmentVariableValue): Promise<Result>;
 }

@@ -3,7 +3,7 @@ import type { IOPacket, TaskRunError, TriggerTaskRequestBody } from "@trigger.de
 import type { AuthenticatedEnvironment } from "~/services/apiAuth.server";
 import type { ReportUsagePlan } from "@trigger.dev/platform";
 
-export type TriggerTaskServiceOptions = {
+type TriggerTaskServiceOptions = {
   idempotencyKey?: string;
   idempotencyKeyExpiresAt?: Date;
   triggerVersion?: string;
@@ -16,6 +16,8 @@ export type TriggerTaskServiceOptions = {
   runFriendlyId?: string;
   skipChecks?: boolean;
   oneTimeUseToken?: string;
+  scheduleId?: string;
+  queueTimestamp?: Date;
   overrideCreatedAt?: Date;
   planType?: string;
 };
@@ -27,12 +29,6 @@ export type TriggerTaskRequest = {
   environment: AuthenticatedEnvironment;
   body: TriggerTaskRequestBody;
   options?: TriggerTaskServiceOptions;
-};
-
-export type TriggerTaskResult = {
-  run: TaskRun;
-  isCached: boolean;
-  error?: TaskRunError;
 };
 
 export type QueueValidationResult =
@@ -48,6 +44,8 @@ export type QueueValidationResult =
 export type QueueProperties = {
   queueName: string;
   lockedQueueId?: string;
+  taskTtl?: string | null;
+  taskKind?: string;
 };
 
 export type LockedBackgroundWorker = Pick<
@@ -61,7 +59,6 @@ export interface QueueManager {
     request: TriggerTaskRequest,
     lockedBackgroundWorker?: LockedBackgroundWorker
   ): Promise<QueueProperties>;
-  getQueueName(request: TriggerTaskRequest): Promise<string>;
   validateQueueLimits(
     env: AuthenticatedEnvironment,
     queueName: string,
@@ -70,7 +67,7 @@ export interface QueueManager {
   getWorkerQueue(
     env: AuthenticatedEnvironment,
     regionOverride?: string
-  ): Promise<string | undefined>;
+  ): Promise<{ masterQueue: string; enableFastPath: boolean } | undefined>;
 }
 
 export interface PayloadProcessor {

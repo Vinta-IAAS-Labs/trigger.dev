@@ -1,5 +1,10 @@
 import { z } from "zod";
-import { RequireKeys } from "../types/index.js";
+import type { RequireKeys } from "../types/index.js";
+import {
+  WebhookVerifierArtifact,
+  WebhookRoutingTarget,
+  WebhookSecretProvisioning,
+} from "./webhookConfig.js";
 import {
   MachineConfig,
   MachinePreset,
@@ -7,6 +12,9 @@ import {
   TaskRunExecution,
   V3TaskRunExecution,
 } from "./common.js";
+import { ScheduleWindow } from "./scheduleWindow.js";
+
+export * from "./scheduleWindow.js";
 
 /*
     WARNING: Never import anything from ./messages here. If it's needed in both, put it here instead.
@@ -178,6 +186,11 @@ export const ScheduleMetadata = z.object({
   cron: z.string(),
   timezone: z.string(),
   environments: z.array(EnvironmentType).optional(),
+  window: ScheduleWindow.optional(),
+});
+
+const AgentConfig = z.object({
+  type: z.string(),
 });
 
 const taskMetadata = {
@@ -187,8 +200,10 @@ const taskMetadata = {
   retry: RetryOptions.optional(),
   machine: MachineConfig.optional(),
   triggerSource: z.string().optional(),
+  agentConfig: AgentConfig.optional(),
   schedule: ScheduleMetadata.optional(),
   maxDuration: z.number().optional(),
+  ttl: z.string().or(z.number().nonnegative().int()).optional(),
   payloadSchema: z.unknown().optional(),
 };
 
@@ -219,6 +234,70 @@ export const TaskManifest = z.object({
 });
 
 export type TaskManifest = z.infer<typeof TaskManifest>;
+
+const promptMetadata = {
+  id: z.string(),
+  description: z.string().optional(),
+  content: z.string().optional(),
+  model: z.string().optional(),
+  config: z.record(z.unknown()).optional(),
+  variableSchema: z.unknown().optional(),
+};
+
+export const PromptMetadata = z.object(promptMetadata);
+
+export type PromptMetadata = z.infer<typeof PromptMetadata>;
+
+export const PromptManifest = z.object({
+  ...promptMetadata,
+  ...taskFileMetadata,
+});
+
+export type PromptManifest = z.infer<typeof PromptManifest>;
+
+// ── Skills ────────────────────────────────────────────────────────────────
+//
+// A skill is a developer-authored folder (SKILL.md + scripts/references/assets)
+// bundled into the deploy image. SkillMetadata is registered at module load
+// by `ai.defineSkill({ id, path })`; the CLI's built-in bundler picks it up
+// during deploy and copies the folder into the deploy image.
+
+const skillMetadata = {
+  id: z.string(),
+  /** Path to the skill's source folder, relative to the project root. */
+  sourcePath: z.string(),
+};
+
+export const SkillMetadata = z.object(skillMetadata);
+export type SkillMetadata = z.infer<typeof SkillMetadata>;
+
+export const SkillManifest = z.object({
+  ...skillMetadata,
+  ...taskFileMetadata,
+});
+export type SkillManifest = z.infer<typeof SkillManifest>;
+
+// ── Webhooks ────────────────────────────────────────────────────────────────
+
+const webhookMetadata = {
+  id: z.string(),
+  description: z.string().optional(),
+  source: z.string(),
+  verifierArtifact: WebhookVerifierArtifact,
+  routingTarget: WebhookRoutingTarget,
+  secretProvisioning: WebhookSecretProvisioning.optional(),
+  filter: z.string().optional(), // delivery filter DSL string; compiled to a FilterAst at deploy-sync
+  metadata: z.record(z.unknown()).optional(),
+};
+
+export const WebhookMetadata = z.object(webhookMetadata);
+export type WebhookMetadata = z.infer<typeof WebhookMetadata>;
+
+export const WebhookManifest = z.object({
+  ...webhookMetadata,
+  ...taskFileMetadata, // filePath, exportName?, entryPoint
+});
+export type WebhookManifest = z.infer<typeof WebhookManifest>;
 
 export const PostStartCauses = z.enum(["index", "create", "restore"]);
 export type PostStartCauses = z.infer<typeof PostStartCauses>;
@@ -271,6 +350,7 @@ export const TaskRunExecutionLazyAttemptPayload = z.object({
   attemptCount: z.number().optional(),
   messageId: z.string(),
   isTest: z.boolean(),
+  isReplay: z.boolean().default(false),
   traceContext: z.record(z.unknown()),
   environment: z.record(z.string()).optional(),
   metrics: TaskRunExecutionMetrics.optional(),

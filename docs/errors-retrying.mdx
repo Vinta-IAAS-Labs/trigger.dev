@@ -12,6 +12,8 @@ You can configure retrying in two ways:
 1. In your [trigger.config file](/config/config-file) you can set the default retrying behavior for all tasks.
 2. On each task you can set the retrying behavior.
 
+<Note>Task-level retry settings override the defaults in your `trigger.config` file.</Note>
+
 <Note>
   By default when you create your project using the CLI init command we disabled retrying in the DEV
   environment. You can enable it in your [trigger.config file](/config/config-file).
@@ -375,3 +377,7 @@ export const openaiTask = task({
   },
 });
 ```
+
+## Replay failed runs in bulk
+
+After you deploy a fix, use [bulk actions](/bulk-actions) to replay multiple failed runs from the dashboard, or [bulk actions with the SDK](/runs/bulk-actions) to replay them from backend code. Bulk replay creates an asynchronous action that targets selected run IDs or a `runs.list()` filter, so you can retry a known failure set without replaying each run individually.

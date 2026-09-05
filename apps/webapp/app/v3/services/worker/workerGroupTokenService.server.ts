@@ -1,38 +1,71 @@
-import { createCache, createLRUMemoryStore, DefaultStatefulContext, Namespace } from "@internal/cache";
 import {
+  createCache,
+  createLRUMemoryStore,
+  DefaultStatefulContext,
+  Namespace,
+} from "@internal/cache";
+import type {
   CheckpointInput,
   CompleteRunAttemptResult,
   DequeuedMessage,
   ExecutionResult,
   MachinePreset,
-  SemanticInternalAttributes,
   StartRunAttemptResult,
   TaskRunExecutionResult,
 } from "@trigger.dev/core/v3";
+import { getMeter } from "@internal/tracing";
+import { SemanticInternalAttributes } from "@trigger.dev/core/v3";
 import { fromFriendlyId } from "@trigger.dev/core/v3/isomorphic";
-import { WORKER_HEADERS } from "@trigger.dev/core/v3/workers";
-import {
-  Prisma,
-  RuntimeEnvironment,
-  WorkerInstanceGroup,
-  WorkerInstanceGroupType,
-} from "@trigger.dev/database";
+import { WORKER_HEADERS, type WorkerQueueClass } from "@trigger.dev/core/v3/workers";
+import type { RuntimeEnvironment, WorkerInstanceGroup } from "@trigger.dev/database";
+import { Prisma, WorkerInstanceGroupType } from "@trigger.dev/database";
+import { json } from "@remix-run/server-runtime";
 import { createHash, timingSafeEqual } from "crypto";
 import { customAlphabet } from "nanoid";
 import { z } from "zod";
 import { env } from "~/env.server";
+import { evaluateCreatedAtGate, runAgeBucket } from "./workloadTokenAuthorization.server";
+import {
+  isWorkerQueueDequeueDisabled,
+  recordBlockedDequeue,
+} from "~/runEngine/concerns/dequeueGate.server";
+import { workerQueueForClass } from "~/runEngine/concerns/workerQueueSplit.server";
 import { generateJWTTokenForEnvironment } from "~/services/apiAuth.server";
 import { logger } from "~/services/logger.server";
 import { defaultMachine } from "~/services/platform.v3.server";
 import { singleton } from "~/utils/singleton";
 import { resolveVariablesForEnvironment } from "~/v3/environmentVariables/environmentVariablesRepository.server";
 import { machinePresetFromName } from "~/v3/machinePresets.server";
-import { WithRunEngine, WithRunEngineOptions } from "../baseService.server";
+import type { WithRunEngineOptions } from "../baseService.server";
+import { WithRunEngine } from "../baseService.server";
 
 const authenticatedWorkerInstanceCache = singleton(
   "authenticatedWorkerInstanceCache",
   createAuthenticatedWorkerInstanceCache
 );
+
+// Opt-in suppression of untokened worker actions on runs created after the cutoff. Only the
+// no-header path ever reads a run row, and only when this is on - default off means feature-off is
+// byte-for-byte today's behavior (no extra reads). Tenant scoping itself is header-driven (folded
+// into the engine snapshot read) and needs no platform flag.
+const workloadCreatedAtGateEnabled = env.WORKLOAD_CREATED_AT_GATE_ENABLED === "1";
+const workloadTokenCutoff = env.WORKLOAD_TOKEN_CUTOFF
+  ? new Date(env.WORKLOAD_TOKEN_CUTOFF)
+  : undefined;
+
+if (workloadCreatedAtGateEnabled && !workloadTokenCutoff) {
+  logger.warn(
+    "WORKLOAD_CREATED_AT_GATE_ENABLED is set but WORKLOAD_TOKEN_CUTOFF is missing; the created-at gate stays off until a cutoff is configured"
+  );
+}
+
+type WorkloadGateAction = "start" | "complete" | "continue" | "snapshots_since";
+
+const meter = getMeter("workload-auth-gate");
+
+const workloadAuthGateCounter = meter.createCounter("workload_auth_gate_total", {
+  description: "Deployment token authorization outcomes on worker actions",
+});
 
 function createAuthenticatedWorkerInstanceCache() {
   return createCache({
@@ -298,7 +331,7 @@ export class WorkerGroupTokenService extends WithRunEngine {
             });
 
             return existingWorkerInstance;
-          } catch (error) {
+          } catch (_error) {
             logger.error("[WorkerGroupTokenService] Failed to find worker instance", {
               workerGroup,
               workerInstance,
@@ -323,12 +356,8 @@ export class WorkerGroupTokenService extends WithRunEngine {
   }
 }
 
-export const WorkerInstanceEnv = z.enum(["dev", "staging", "prod"]).default("prod");
-export type WorkerInstanceEnv = z.infer<typeof WorkerInstanceEnv>;
-
-type EnvironmentWithParent = RuntimeEnvironment & {
-  parentEnvironment?: RuntimeEnvironment | null;
-};
+const WorkerInstanceEnv = z.enum(["dev", "staging", "prod"]).default("prod");
+type WorkerInstanceEnv = z.infer<typeof WorkerInstanceEnv>;
 
 export type AuthenticatedWorkerInstanceOptions = WithRunEngineOptions<{
   type: WorkerInstanceGroupType;
@@ -369,10 +398,23 @@ export class AuthenticatedWorkerInstance extends WithRunEngine {
     });
   }
 
-  async dequeue({ runnerId }: { runnerId?: string }): Promise<DequeuedMessage[]> {
+  async dequeue({
+    runnerId,
+    queueClass,
+  }: {
+    runnerId?: string;
+    queueClass?: WorkerQueueClass;
+  }): Promise<DequeuedMessage[]> {
+    const workerQueue = workerQueueForClass(this.masterQueue, queueClass);
+
+    if (isWorkerQueueDequeueDisabled(workerQueue)) {
+      recordBlockedDequeue(workerQueue);
+      return [];
+    }
+
     return await this._engine.dequeueFromWorkerQueue({
       consumerId: this.workerInstanceId,
-      workerQueue: this.masterQueue,
+      workerQueue,
       workerId: this.workerInstanceId,
       runnerId,
     });
@@ -387,6 +429,63 @@ export class AuthenticatedWorkerInstance extends WithRunEngine {
         lastHeartbeatAt: new Date(),
       },
     });
+  }
+
+  /**
+   * The no-header fallback. When the env header is present the engine scopes the snapshot read by it
+   * (nothing to do here). When it's absent, this optionally suppresses runs created after the cutoff -
+   * a run that new enough should have carried a token, so a missing one is treated as out-of-scope.
+   * Only runs when the gate is enabled AND a cutoff is set; that's the ONLY path that reads a run row.
+   */
+  private async assertCreatedAtGate({
+    runId,
+    environmentId,
+    action,
+  }: {
+    runId: string;
+    environmentId?: string;
+    action: WorkloadGateAction;
+  }): Promise<void> {
+    if (environmentId) {
+      // Scoping is delegated to the engine snapshot read; no run-row read here. Recorded so the
+      // platform can see how much traffic is env-scoped as enforcement rolls out.
+      workloadAuthGateCounter.add(1, { outcome: "env_scoped", action });
+      return;
+    }
+
+    if (!workloadCreatedAtGateEnabled || !workloadTokenCutoff) {
+      return;
+    }
+
+    const run = await this._engine.runStore.findRun(
+      { id: runId },
+      { select: { createdAt: true, environmentType: true } }
+    );
+
+    if (!run) {
+      // Let the engine method surface the canonical not-found error.
+      return;
+    }
+
+    const { allow, outcome } = evaluateCreatedAtGate({
+      runCreatedAt: run.createdAt,
+      cutoff: workloadTokenCutoff,
+    });
+
+    workloadAuthGateCounter.add(1, {
+      outcome,
+      action,
+      env_type: run.environmentType ?? "unknown",
+      run_age_bucket: runAgeBucket(run.createdAt, new Date()),
+    });
+
+    if (!allow) {
+      logger.warn("[workload-auth] rejecting untokened worker action created after cutoff", {
+        action,
+        runId,
+      });
+      throw json({ error: "Run does not belong to this worker" }, { status: 403 });
+    }
   }
 
   async heartbeatRun({
@@ -411,32 +510,46 @@ export class AuthenticatedWorkerInstance extends WithRunEngine {
     snapshotFriendlyId,
     isWarmStart,
     runnerId,
+    environmentId,
   }: {
     runFriendlyId: string;
     snapshotFriendlyId: string;
     isWarmStart?: boolean;
     runnerId?: string;
+    environmentId?: string;
   }): Promise<
     StartRunAttemptResult & {
       envVars: Record<string, string>;
     }
   > {
+    await this.assertCreatedAtGate({
+      runId: fromFriendlyId(runFriendlyId),
+      environmentId,
+      action: "start",
+    });
+
     const engineResult = await this._engine.startRunAttempt({
       runId: fromFriendlyId(runFriendlyId),
       snapshotId: fromFriendlyId(snapshotFriendlyId),
       isWarmStart,
       workerId: this.workerInstanceId,
       runnerId,
+      environmentId,
     });
 
     const defaultMachinePreset = machinePresetFromName(defaultMachine);
 
-    const environment = await this._prisma.runtimeEnvironment.findFirst({
+    const environmentReader =
+      env.CONTROL_PLANE_DEQUEUE_READS_FROM_REPLICA === "1" ? this._replica : this._prisma;
+
+    const environment = await environmentReader.runtimeEnvironment.findFirst({
       where: {
         id: engineResult.execution.environment.id,
       },
       include: {
         parentEnvironment: true,
+        // Feeds resolveProdApiOrigin; only loaded when internal-origin routing is possible.
+        ...(env.INTERNAL_API_ORIGIN ? { organization: { select: { featureFlags: true } } } : {}),
       },
     });
 
@@ -461,24 +574,42 @@ export class AuthenticatedWorkerInstance extends WithRunEngine {
     snapshotFriendlyId,
     completion,
     runnerId,
+    environmentId,
   }: {
     runFriendlyId: string;
     snapshotFriendlyId: string;
     completion: TaskRunExecutionResult;
     runnerId?: string;
+    environmentId?: string;
   }): Promise<CompleteRunAttemptResult> {
+    await this.assertCreatedAtGate({
+      runId: fromFriendlyId(runFriendlyId),
+      environmentId,
+      action: "complete",
+    });
+
     return await this._engine.completeRunAttempt({
       runId: fromFriendlyId(runFriendlyId),
       snapshotId: fromFriendlyId(snapshotFriendlyId),
       completion,
       workerId: this.workerInstanceId,
       runnerId,
+      environmentId,
     });
   }
 
-  async getLatestSnapshot({ runFriendlyId }: { runFriendlyId: string }) {
+  async getLatestSnapshot({
+    runFriendlyId,
+    environmentId,
+  }: {
+    runFriendlyId: string;
+    environmentId?: string;
+  }) {
+    // No created-at gate: the only untokened caller is an internal warm-start poll that legitimately
+    // has no token, so an absent header must not reject. When a header is present the engine scopes.
     return await this._engine.getRunExecutionData({
       runId: fromFriendlyId(runFriendlyId),
+      environmentId,
     });
   }
 
@@ -506,29 +637,47 @@ export class AuthenticatedWorkerInstance extends WithRunEngine {
     runFriendlyId,
     snapshotFriendlyId,
     runnerId,
+    environmentId,
   }: {
     runFriendlyId: string;
     snapshotFriendlyId: string;
     runnerId?: string;
+    environmentId?: string;
   }) {
+    await this.assertCreatedAtGate({
+      runId: fromFriendlyId(runFriendlyId),
+      environmentId,
+      action: "continue",
+    });
+
     return await this._engine.continueRunExecution({
       runId: fromFriendlyId(runFriendlyId),
       snapshotId: fromFriendlyId(snapshotFriendlyId),
       workerId: this.workerInstanceId,
       runnerId,
+      environmentId,
     });
   }
 
   async getSnapshotsSince({
     runFriendlyId,
     snapshotId,
+    environmentId,
   }: {
     runFriendlyId: string;
     snapshotId: string;
+    environmentId?: string;
   }) {
+    await this.assertCreatedAtGate({
+      runId: fromFriendlyId(runFriendlyId),
+      environmentId,
+      action: "snapshots_since",
+    });
+
     return await this._engine.getSnapshotsSince({
       runId: fromFriendlyId(runFriendlyId),
       snapshotId: fromFriendlyId(snapshotId),
+      environmentId,
     });
   }
 

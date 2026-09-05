@@ -17,25 +17,27 @@ export const ApiAlertType = z.enum([
   "attempt_failure",
   "deployment_failure",
   "deployment_success",
+  "error_group",
+  "dashboard_agent_watch",
 ]);
 
 export type ApiAlertType = z.infer<typeof ApiAlertType>;
 
-export const ApiAlertEnvironmentType = z.enum(["STAGING", "PRODUCTION"]);
+const ApiAlertEnvironmentType = z.enum(["STAGING", "PRODUCTION"]);
 
-export type ApiAlertEnvironmentType = z.infer<typeof ApiAlertEnvironmentType>;
+type ApiAlertEnvironmentType = z.infer<typeof ApiAlertEnvironmentType>;
 
 export const ApiAlertChannel = z.enum(["email", "webhook"]);
 
 export type ApiAlertChannel = z.infer<typeof ApiAlertChannel>;
 
-export const ApiAlertChannelData = z.object({
+const ApiAlertChannelData = z.object({
   email: z.string().optional(),
   url: z.string().optional(),
   secret: z.string().optional(),
 });
 
-export type ApiAlertChannelData = z.infer<typeof ApiAlertChannelData>;
+type ApiAlertChannelData = z.infer<typeof ApiAlertChannelData>;
 
 export const ApiCreateAlertChannel = z.object({
   alertTypes: ApiAlertType.array(),
@@ -85,6 +87,10 @@ export class ApiAlertChannelPresenter {
         return "deployment_failure";
       case "DEPLOYMENT_SUCCESS":
         return "deployment_success";
+      case "ERROR_GROUP":
+        return "error_group";
+      case "DASHBOARD_AGENT_WATCH":
+        return "dashboard_agent_watch";
       default:
         assertNever(alertType);
     }
@@ -100,6 +106,10 @@ export class ApiAlertChannelPresenter {
         return "DEPLOYMENT_FAILURE";
       case "deployment_success":
         return "DEPLOYMENT_SUCCESS";
+      case "error_group":
+        return "ERROR_GROUP";
+      case "dashboard_agent_watch":
+        return "DASHBOARD_AGENT_WATCH";
       default:
         assertNever(alertType);
     }

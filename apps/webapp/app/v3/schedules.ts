@@ -1,3 +1,4 @@
+import { ScheduleWindow } from "@trigger.dev/core/v3";
 import { parseExpression } from "cron-parser";
 import { z } from "zod";
 
@@ -16,7 +17,7 @@ export const CronPattern = z.string().refine(
     try {
       parseExpression(val);
       return true;
-    } catch (e) {
+    } catch (_e) {
       return false;
     }
   },
@@ -56,6 +57,7 @@ export const UpsertSchedule = z.object({
   externalId: z.string().optional(),
   deduplicationKey: z.string().optional(),
   timezone: z.string().optional(),
+  window: z.preprocess((value) => (value === "" ? undefined : value), ScheduleWindow.optional()),
 });
 
 export type UpsertSchedule = z.infer<typeof UpsertSchedule>;

@@ -1,8 +1,7 @@
-import { recordSpanException } from "@trigger.dev/core/v3/workers";
+import type { GitMeta } from "@trigger.dev/core/v3";
 import { CliApiClient } from "../apiClient.js";
 import { readAuthConfigProfile } from "./configFiles.js";
 import { logger } from "./logger.js";
-import { GitMeta } from "@trigger.dev/core/v3";
 
 export type LoginResultOk = {
   ok: true;
@@ -113,6 +112,7 @@ export async function getProjectClient(options: GetEnvOptions) {
   return {
     id: projectEnv.data.projectId,
     name: projectEnv.data.name,
+    defaultRuntime: projectEnv.data.defaultRuntime,
     client,
   };
 }

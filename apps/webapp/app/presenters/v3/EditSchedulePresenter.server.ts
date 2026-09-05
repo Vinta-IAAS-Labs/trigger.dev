@@ -6,6 +6,7 @@ import { filterOrphanedEnvironments } from "~/utils/environmentSort";
 import { getTimezones } from "~/utils/timezones.server";
 import { findCurrentWorkerFromEnvironment } from "~/v3/models/workerDeployment.server";
 import { ServiceValidationError } from "~/v3/services/baseService.server";
+import { formatScheduleWindow } from "~/v3/scheduleWindow.server";
 
 type EditScheduleOptions = {
   userId: string;
@@ -51,6 +52,7 @@ export class EditSchedulePresenter {
               },
             },
             branchName: true,
+            parentEnvironmentId: true,
           },
         },
       },
@@ -87,15 +89,17 @@ export class EditSchedulePresenter {
       : [];
 
     const possibleEnvironments = filterOrphanedEnvironments(project.environments)
+      // Exclude the branchable PREVIEW parent (it has no parent of its own);
+      // only actual preview branches are schedulable.
+      .filter(
+        (environment) =>
+          !(environment.type === "PREVIEW" && environment.parentEnvironmentId === null)
+      )
       .map((environment) => {
         return {
           ...displayableEnvironment(environment, userId),
           branchName: environment.branchName ?? undefined,
         };
-      })
-      .filter((env) => {
-        if (env.type === "PREVIEW" && !env.branchName) return false;
-        return true;
       });
 
     return {
@@ -121,6 +125,8 @@ export class EditSchedulePresenter {
         deduplicationKey: true,
         userProvidedDeduplicationKey: true,
         timezone: true,
+        windowDurationSeconds: true,
+        windowPercentage: true,
         taskIdentifier: true,
         instances: {
           select: {
@@ -141,6 +147,7 @@ export class EditSchedulePresenter {
     return {
       ...schedule,
       cron: schedule.generatorExpression,
+      window: formatScheduleWindow(schedule),
       environments: schedule.instances.flatMap((instance) => {
         const environment = possibleEnvironments.find((env) => env.id === instance.environmentId);
         if (!environment) {

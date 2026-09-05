@@ -1,5 +1,6 @@
 import chalk from "chalk";
 import { getLatestVersion } from "fast-npm-meta";
+import * as semver from "semver";
 import { VERSION } from "../version.js";
 import { chalkGrey, chalkRun, chalkTask, chalkWorker, logo } from "./cliOutput.js";
 import { logger } from "./logger.js";
@@ -54,7 +55,6 @@ export async function printInitialBanner(performUpdateCheck = true, profile?: st
 Run \`npm install --save-dev trigger.dev@${newMajor}\` to update to the latest version.
 After installation, run Trigger.dev with \`npx trigger.dev\`.`
         );
-      } else {
       }
     } else {
       $spinner.stop("On latest version");
@@ -105,18 +105,16 @@ async function doUpdateCheck(): Promise<string | undefined> {
       return;
     }
 
-    const compareVersions = (a: string, b: string) =>
-      a.localeCompare(b, "en-US", { numeric: true });
-
-    const comparison = compareVersions(VERSION, meta.version);
-
-    if (comparison === -1) {
+    // Use real semver comparison (loose) so prereleases sort correctly against
+    // their stable counterpart — e.g. a user on `4.5.0-rc.0` sees `4.5.0` as
+    // newer. String/locale comparison gets this wrong for `X.Y.Z-rc.N` vs `X.Y.Z`.
+    if (semver.lt(VERSION, meta.version, true)) {
       return meta.version;
     }
 
     return;
   } catch (err) {
-    // ignore error
+    // ignore error (covers both network failures and any version-parse oddities)
     logger.debug(err);
 
     return;

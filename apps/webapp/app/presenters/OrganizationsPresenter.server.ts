@@ -4,13 +4,11 @@ import { prisma } from "~/db.server";
 import { logger } from "~/services/logger.server";
 import { type UserFromSession } from "~/services/session.server";
 import { newOrganizationPath, newProjectPath } from "~/utils/pathBuilder";
-import {
-  SelectBestEnvironmentPresenter,
-  type MinimumEnvironment,
-} from "./SelectBestEnvironmentPresenter.server";
+import { SelectBestEnvironmentPresenter } from "./SelectBestEnvironmentPresenter.server";
 import { sortEnvironments } from "~/utils/environmentSort";
 import { defaultAvatar, parseAvatar } from "~/components/primitives/Avatar";
-import { flags, validatePartialFeatureFlags } from "~/v3/featureFlags.server";
+import { globalFeatureFlags, mergeOrgFeatureFlags } from "~/v3/featureFlags.server";
+import { hydrateEnvsWithActivity } from "./v3/BranchesPresenter.server";
 
 export class OrganizationsPresenter {
   #prismaClient: PrismaClient;
@@ -77,10 +75,12 @@ export class OrganizationsPresenter {
             type: true,
             slug: true,
             paused: true,
+            pauseSource: true,
             isBranchableEnvironment: true,
             branchName: true,
             parentEnvironmentId: true,
             archivedAt: true,
+            updatedAt: true,
             orgMember: {
               select: {
                 userId: true,
@@ -100,10 +100,20 @@ export class OrganizationsPresenter {
       throw redirect(newProjectPath(organization));
     }
 
+    const environments = fullProject.environments.filter(
+      (env) => env.type !== "DEVELOPMENT" || env.orgMember?.userId === user.id
+    );
+
+    const environmentsWithActivity = await hydrateEnvsWithActivity(
+      user.id,
+      fullProject.id,
+      environments
+    );
+
     const environment = this.#getEnvironment({
       user,
       projectId: fullProject.id,
-      environments: fullProject.environments,
+      environments,
       environmentSlug,
     });
 
@@ -113,13 +123,7 @@ export class OrganizationsPresenter {
       project: {
         ...fullProject,
         createdAt: fullProject.createdAt,
-        environments: sortEnvironments(
-          fullProject.environments.filter((env) => {
-            if (env.type !== "DEVELOPMENT") return true;
-            if (env.orgMember?.userId === user.id) return true;
-            return false;
-          })
-        ),
+        environments: sortEnvironments(environmentsWithActivity),
       },
       environment,
     };
@@ -146,25 +150,13 @@ export class OrganizationsPresenter {
           },
           orderBy: { name: "asc" },
         },
-        _count: {
-          select: {
-            members: true,
-          },
-        },
       },
     });
 
-    // Get global feature flags (no overrides or defaults)
-    const globalFlags = await flags();
+    const globalFlags = await globalFeatureFlags();
 
     return orgs.map((org) => {
-      const orgFlagsResult = org.featureFlags
-        ? validatePartialFeatureFlags(org.featureFlags as Record<string, unknown>)
-        : ({ success: false } as const);
-      const orgFlags = orgFlagsResult.success ? orgFlagsResult.data : {};
-
-      // Combine global flags with org flags (org flags win)
-      const combinedFlags = { ...globalFlags, ...orgFlags };
+      const combinedFlags = mergeOrgFeatureFlags(globalFlags, org.featureFlags);
 
       return {
         id: org.id,
@@ -179,7 +171,6 @@ export class OrganizationsPresenter {
           updatedAt: project.updatedAt,
           externalRef: project.externalRef,
         })),
-        membersCount: org._count.members,
       };
     });
   }
@@ -200,6 +191,7 @@ export class OrganizationsPresenter {
       | "type"
       | "branchName"
       | "paused"
+      | "pauseSource"
       | "parentEnvironmentId"
       | "isBranchableEnvironment"
       | "archivedAt"
@@ -210,7 +202,11 @@ export class OrganizationsPresenter {
     })[];
   }) {
     if (environmentSlug) {
-      const env = environments.find((e) => e.slug === environmentSlug);
+      const env = environments.find(
+        (e) =>
+          e.slug === environmentSlug &&
+          (e.type !== "DEVELOPMENT" || e.orgMember?.userId === user.id)
+      );
       if (env) {
         return env;
       }
@@ -218,7 +214,7 @@ export class OrganizationsPresenter {
       if (!env) {
         logger.info("Not Found: environment", {
           environmentSlug,
-          environments,
+          environmentCount: environments.length,
         });
       }
     }
@@ -233,7 +229,10 @@ export class OrganizationsPresenter {
 
     //otherwise show their dev environment
     const yourDevEnvironment = environments.find(
-      (env) => env.type === "DEVELOPMENT" && env.orgMember?.userId === user.id
+      (env) =>
+        env.type === "DEVELOPMENT" &&
+        env.parentEnvironmentId === null &&
+        env.orgMember?.userId === user.id
     );
     if (yourDevEnvironment) {
       return yourDevEnvironment;

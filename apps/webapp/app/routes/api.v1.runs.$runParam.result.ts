@@ -2,7 +2,10 @@ import type { LoaderFunctionArgs } from "@remix-run/server-runtime";
 import { json } from "@remix-run/server-runtime";
 import { z } from "zod";
 import { ApiRunResultPresenter } from "~/presenters/v3/ApiRunResultPresenter.server";
+import { runOpsLegacyReplica, runOpsNewReplica, runOpsSplitReadEnabled } from "~/db.server";
 import { authenticateApiRequest } from "~/services/apiAuth.server";
+import { logger } from "~/services/logger.server";
+import { unroutableIdResponse } from "~/services/routeBuilders/unroutableId.server";
 
 const ParamsSchema = z.object({
   /* This is the run friendly ID */
@@ -26,7 +29,11 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
   const { runParam } = parsed.data;
 
   try {
-    const presenter = new ApiRunResultPresenter();
+    const presenter = new ApiRunResultPresenter(undefined, undefined, {
+      newClient: runOpsNewReplica,
+      legacyReplica: runOpsLegacyReplica,
+      splitEnabled: runOpsSplitReadEnabled,
+    });
     const result = await presenter.call(runParam, authenticationResult.environment);
 
     if (!result) {
@@ -35,10 +42,15 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
 
     return json(result);
   } catch (error) {
-    if (error instanceof Error) {
-      return json({ error: error.message }, { status: 500 });
-    } else {
-      return json({ error: JSON.stringify(error) }, { status: 500 });
+    const unroutable = unroutableIdResponse(error);
+    if (unroutable) {
+      logger.warn("Unroutable run id on run result", {
+        error: error instanceof Error ? error.message : error,
+      });
+      return unroutable;
     }
+
+    logger.error("Failed to load run result", { error });
+    return json({ error: "Something went wrong, please try again." }, { status: 500 });
   }
 }

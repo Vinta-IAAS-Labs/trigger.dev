@@ -1,7 +1,51 @@
-import { Redis, type RedisOptions } from "ioredis";
+import { type Cluster, Redis, type RedisOptions } from "ioredis";
 import { Logger } from "@trigger.dev/core/logger";
 
-export { Redis, type Callback, type RedisOptions, type Result, type RedisCommander } from "ioredis";
+export {
+  Redis,
+  Cluster,
+  type Callback,
+  type RedisOptions,
+  type ClusterNode,
+  type ClusterOptions,
+  type Result,
+  type RedisCommander,
+} from "ioredis";
+
+/**
+ * Either endpoint shape. A component that only issues key-addressed commands works against both, so
+ * it should accept this rather than pin itself to a standalone connection. Commands with no key —
+ * SCAN above all — do NOT fan out across a cluster, so anything that issues one must iterate
+ * `cluster.nodes("master")` itself.
+ */
+export type RedisClient = Redis | Cluster;
+
+/**
+ * Reply-error -> reconnect mapping. Without this hook, an ElastiCache
+ * vertical scale-up surfaces tens of thousands of READONLY / LOADING
+ * reply errors to caller code over a healthy TCP/TLS connection (the
+ * client keeps talking to a node whose role swapped underneath it).
+ *
+ * UNBLOCKED is the BLPOP-shaped case: the Redis primary forcibly
+ * unblocks any blocking command on a connection whose node is about
+ * to be demoted, returning an UNBLOCKED reply. Surfaced 65 times on
+ * engine/v1/worker-actions/dequeue at the cutover instant during the
+ * TRI-8873 test-cloud scale-up dry-run.
+ *
+ * Returning 2 tells ioredis to disconnect, reconnect, and retry the
+ * command that triggered the error. After reconnect, DNS / SG routing
+ * should land on a writable primary.
+ *
+ * Empirical confirmation on the harness in TRI-8878: this option
+ * reduced a scale-up event from ~437,000 caller-surfaced errors to 2.
+ */
+export function defaultReconnectOnError(err: Error): boolean | 1 | 2 {
+  const msg = err.message ?? "";
+  if (msg.startsWith("READONLY") || msg.startsWith("LOADING") || msg.startsWith("UNBLOCKED")) {
+    return 2;
+  }
+  return false;
+}
 
 const defaultOptions: Partial<RedisOptions> = {
   retryStrategy: (times: number) => {
@@ -9,6 +53,7 @@ const defaultOptions: Partial<RedisOptions> = {
     return delay;
   },
   maxRetriesPerRequest: process.env.GITHUB_ACTIONS ? 50 : process.env.VITEST ? 5 : 20,
+  reconnectOnError: defaultReconnectOnError,
 };
 
 const logger = new Logger("Redis", "debug");

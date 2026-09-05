@@ -1,27 +1,20 @@
-import { conform, useForm } from "@conform-to/react";
-import { parse } from "@conform-to/zod";
-import {
-  ArrowRightIcon,
-  ArrowUpCircleIcon,
-  CheckIcon,
-  MagnifyingGlassIcon,
-  PlusIcon,
-} from "@heroicons/react/20/solid";
+import { getFormProps, getInputProps, useForm } from "@conform-to/react";
+import { parseWithZod } from "@conform-to/zod";
+import { ArrowUpCircleIcon, CheckIcon, EnvelopeIcon, PlusIcon } from "@heroicons/react/20/solid";
 import { BookOpenIcon } from "@heroicons/react/24/solid";
 import { DialogClose } from "@radix-ui/react-dialog";
-import { Form, useActionData, useLocation, useSearchParams } from "@remix-run/react";
+import { useFetcher, useSearchParams } from "@remix-run/react";
 import { type ActionFunctionArgs, json, type LoaderFunctionArgs } from "@remix-run/server-runtime";
-import { GitMeta } from "@trigger.dev/core/v3";
+import { tryCatch } from "@trigger.dev/core/v3";
 import { useCallback, useEffect, useState } from "react";
+import { SearchInput } from "~/components/primitives/SearchInput";
 import { typedjson, useTypedLoaderData } from "remix-typedjson";
 import { z } from "zod";
 import { BranchEnvironmentIconSmall } from "~/assets/icons/EnvironmentIcons";
 import { BranchesNoBranchableEnvironment, BranchesNoBranches } from "~/components/BlankStatePanels";
 import { Feedback } from "~/components/Feedback";
 import { GitMetadata } from "~/components/GitMetadata";
-import { V4Title } from "~/components/V4Badge";
 import { AdminDebugTooltip } from "~/components/admin/debugTooltip";
-import { InlineCode } from "~/components/code/InlineCode";
 import { MainCenteredContainer, PageBody, PageContainer } from "~/components/layout/AppLayout";
 import { Badge } from "~/components/primitives/Badge";
 import { Button, LinkButton } from "~/components/primitives/Buttons";
@@ -38,15 +31,15 @@ import { Fieldset } from "~/components/primitives/Fieldset";
 import { FormButtons } from "~/components/primitives/FormButtons";
 import { FormError } from "~/components/primitives/FormError";
 import { Header3 } from "~/components/primitives/Headers";
-import { Hint } from "~/components/primitives/Hint";
-import { Input } from "~/components/primitives/Input";
 import { InputGroup } from "~/components/primitives/InputGroup";
+import { InputNumberStepper } from "~/components/primitives/InputNumberStepper";
 import { Label } from "~/components/primitives/Label";
 import { NavBar, PageAccessories, PageTitle } from "~/components/primitives/PageHeader";
 import { PaginationControls } from "~/components/primitives/Pagination";
 import { Paragraph } from "~/components/primitives/Paragraph";
 import { PopoverMenuItem } from "~/components/primitives/Popover";
 import * as Property from "~/components/primitives/PropertyTable";
+import { SpinnerWhite } from "~/components/primitives/Spinner";
 import { Switch } from "~/components/primitives/Switch";
 import {
   Table,
@@ -60,24 +53,48 @@ import {
 } from "~/components/primitives/Table";
 import { InfoIconTooltip, SimpleTooltip } from "~/components/primitives/Tooltip";
 import { useEnvironment } from "~/hooks/useEnvironment";
+import { useShowSelfServe } from "~/hooks/useShowSelfServe";
 import { useOrganization } from "~/hooks/useOrganizations";
 import { useProject } from "~/hooks/useProject";
-import { useThrottle } from "~/hooks/useThrottle";
-import { redirectWithErrorMessage, redirectWithSuccessMessage } from "~/models/message.server";
+
+import { findProjectBySlug } from "~/models/project.server";
+import { redirectWithErrorMessage } from "~/models/message.server";
 import { BranchesPresenter } from "~/presenters/v3/BranchesPresenter.server";
 import { logger } from "~/services/logger.server";
+import { getCurrentPlan, getSelfServePurchaseBlockReason } from "~/services/platform.v3.server";
 import { requireUserId } from "~/services/session.server";
-import { UpsertBranchService } from "~/services/upsertBranch.server";
 import { cn } from "~/utils/cn";
-import { branchesPath, docsPath, ProjectParamSchema, v3BillingPath } from "~/utils/pathBuilder";
+import {
+  branchesPath,
+  docsPath,
+  EnvironmentParamSchema,
+  ProjectParamSchema,
+  v3BillingPath,
+} from "~/utils/pathBuilder";
+import { formatCurrency, formatNumber } from "~/utils/numberFormatter";
+import { SetBranchesAddOnService } from "~/v3/services/setBranchesAddOn.server";
 import { useCurrentPlan } from "../_app.orgs.$organizationSlug/route";
 import { ArchiveButton } from "../resources.branches.archive";
+import { NewBranchPanel } from "~/routes/resources.branches.create";
+import { BranchesOptions } from "~/utils/branches";
+import { IconArrowBearRight2 } from "@tabler/icons-react";
+import { branchesAgentPageContext } from "~/components/dashboard-agent/suggested-prompts";
+import { WhenAgentUnavailable } from "~/components/dashboard-agent/WhenAgentUnavailable";
+import type { Handle } from "~/utils/handle";
+import { pageMeta } from "~/utils/pageTitle";
 
-export const BranchesOptions = z.object({
-  search: z.string().optional(),
-  showArchived: z.preprocess((val) => val === "true" || val === true, z.boolean()).optional(),
-  page: z.preprocess((val) => Number(val), z.number()).optional(),
-});
+export const meta = pageMeta("Preview branches");
+
+const PurchaseSchema = z.discriminatedUnion("action", [
+  z.object({
+    action: z.literal("purchase"),
+    amount: z.coerce.number().int("Must be a whole number").min(0, "Amount must be 0 or more"),
+  }),
+  z.object({
+    action: z.literal("quota-increase"),
+    amount: z.coerce.number().int("Must be a whole number").min(1, "Amount must be greater than 0"),
+  }),
+]);
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const userId = await requireUserId(request);
@@ -92,6 +109,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     const result = await presenter.call({
       userId,
       projectSlug: projectParam,
+      env: "preview",
       ...options,
     });
 
@@ -105,88 +123,118 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   }
 };
 
-export const CreateBranchOptions = z.object({
-  parentEnvironmentId: z.string(),
-  branchName: z.string().min(1),
-  git: GitMeta.optional(),
-});
-
-export type CreateBranchOptions = z.infer<typeof CreateBranchOptions>;
-
-export const schema = CreateBranchOptions.and(
-  z.object({
-    failurePath: z.string(),
-  })
-);
-
-export async function action({ request }: ActionFunctionArgs) {
+export async function action({ request, params }: ActionFunctionArgs) {
   const userId = await requireUserId(request);
 
   const formData = await request.formData();
-  const submission = parse(formData, { schema });
+  const formType = formData.get("_formType");
 
-  if (!submission.value) {
-    return redirectWithErrorMessage("/", request, "Invalid form data");
-  }
+  if (formType === "purchase-branches") {
+    const { organizationSlug, projectParam, envParam } = EnvironmentParamSchema.parse(params);
+    const project = await findProjectBySlug(organizationSlug, projectParam, userId);
+    const redirectPath = branchesPath(
+      { slug: organizationSlug },
+      { slug: projectParam },
+      { slug: envParam }
+    );
 
-  const upsertBranchService = new UpsertBranchService();
-  const result = await upsertBranchService.call(
-    { type: "userMembership", userId },
-    submission.value
-  );
-
-  if (result.success) {
-    if (result.alreadyExisted) {
-      submission.error = {
-        branchName: [
-          `Branch "${result.branch.branchName}" already exists. You can archive it and create a new one with the same name.`,
-        ],
-      };
-      return json(submission);
+    if (!project) {
+      throw await redirectWithErrorMessage(redirectPath, request, "Project not found");
     }
 
-    return redirectWithSuccessMessage(
-      `${branchesPath(result.organization, result.project, result.branch)}?dialogClosed=true`,
-      request,
-      `Branch "${result.branch.branchName}" created`
+    const currentPlan = await getCurrentPlan(project.organizationId);
+    const purchaseBlockReason = getSelfServePurchaseBlockReason(currentPlan);
+    if (purchaseBlockReason === "plan_unavailable") {
+      return json(
+        { ok: false, error: "Unable to verify billing status. Please try again." } as const,
+        { status: 503 }
+      );
+    }
+    if (purchaseBlockReason === "managed_billing") {
+      return json({ ok: false, error: "Contact us to request more branches." } as const, {
+        status: 403,
+      });
+    }
+
+    const submission = parseWithZod(formData, { schema: PurchaseSchema });
+
+    if (submission.status !== "success") {
+      return json(submission.reply());
+    }
+
+    const service = new SetBranchesAddOnService();
+    const [error, result] = await tryCatch(
+      service.call({
+        userId,
+        organizationId: project.organizationId,
+        action: submission.value.action,
+        amount: submission.value.amount,
+      })
     );
+
+    if (error) {
+      return json(
+        submission.reply({
+          fieldErrors: { amount: [error instanceof Error ? error.message : "Unknown error"] },
+        })
+      );
+    }
+
+    if (!result.success) {
+      return json(submission.reply({ fieldErrors: { amount: [result.error] } }));
+    }
+
+    return json({ ok: true } as const);
   }
 
-  submission.error = { branchName: [result.error] };
-  return json(submission);
+  // Branch creation is handled by the `resources.branches.create` resource
+  // route; this action only services the purchase flow above.
+  return json({ ok: false, error: "Unsupported action" } as const, { status: 400 });
 }
+
+export const handle: Handle = {
+  agentPageContext: (data) => branchesAgentPageContext(data),
+};
 
 export default function Page() {
   const {
     branchableEnvironment,
     branches,
-    hasFilters,
+    hasFilters: _hasFilters,
     limits,
     currentPage,
     totalPages,
     hasBranches,
+    canPurchaseBranches,
+    extraBranches,
+    branchPricing,
+    maxBranchQuota,
+    planBranchLimit,
   } = useTypedLoaderData<typeof loader>();
   const organization = useOrganization();
   const project = useProject();
   const environment = useEnvironment();
 
   const plan = useCurrentPlan();
+  const showSelfServe = useShowSelfServe();
   const requiresUpgrade =
     plan?.v3Subscription?.plan &&
     limits.used >= plan.v3Subscription.plan.limits.branches.number &&
     !plan.v3Subscription.plan.limits.branches.canExceed;
   const canUpgrade =
     plan?.v3Subscription?.plan && !plan.v3Subscription.plan.limits.branches.canExceed;
+  const atBranchLimit = limits.used >= limits.limit;
+  const usageRatio = limits.limit > 0 ? Math.min(limits.used / limits.limit, 1) : 0;
 
   if (!branchableEnvironment) {
     return (
       <PageContainer>
         <NavBar>
-          <PageTitle title={<V4Title>Preview branches</V4Title>} />
+          <PageTitle title="Preview branches" />
         </NavBar>
         <PageBody>
           <MainCenteredContainer className="max-w-md">
-            <BranchesNoBranchableEnvironment />
+            <BranchesNoBranchableEnvironment showSelfServe={showSelfServe} />
           </MainCenteredContainer>
         </PageBody>
       </PageContainer>
@@ -196,29 +244,41 @@ export default function Page() {
   return (
     <PageContainer>
       <NavBar>
-        <PageTitle title={<V4Title>Preview branches</V4Title>} />
+        <PageTitle title="Preview branches" />
         <PageAccessories>
           <AdminDebugTooltip>
             <Property.Table>
               {branches.map((branch) => (
                 <Property.Item key={branch.id}>
                   <Property.Label>{branch.branchName}</Property.Label>
-                  <Property.Value>{branch.id}</Property.Value>
+                  <Property.Value>
+                    <CopyableText value={branch.id} asChild hideTooltip />
+                  </Property.Value>
                 </Property.Item>
               ))}
             </Property.Table>
           </AdminDebugTooltip>
 
-          <LinkButton
-            variant={"docs/small"}
-            LeadingIcon={BookOpenIcon}
-            to={docsPath("deployment/preview-branches")}
-          >
-            Branches docs
-          </LinkButton>
+          <WhenAgentUnavailable>
+            <LinkButton
+              variant={"docs/small"}
+              LeadingIcon={BookOpenIcon}
+              to={docsPath("deployment/preview-branches")}
+            >
+              Branches docs
+            </LinkButton>
+          </WhenAgentUnavailable>
 
           {limits.isAtLimit ? (
-            <UpgradePanel limits={limits} canUpgrade={canUpgrade ?? false} />
+            <UpgradePanel
+              limits={limits}
+              canUpgrade={canUpgrade ?? false}
+              canPurchaseBranches={canPurchaseBranches}
+              branchPricing={branchPricing}
+              extraBranches={extraBranches}
+              maxBranchQuota={maxBranchQuota}
+              planBranchLimit={planBranchLimit}
+            />
           ) : (
             <NewBranchPanel
               button={
@@ -230,10 +290,10 @@ export default function Page() {
                   fullWidth
                   textAlignLeft
                 >
-                  New branch
+                  New branch…
                 </Button>
               }
-              parentEnvironment={branchableEnvironment}
+              env="preview"
             />
           )}
         </PageAccessories>
@@ -243,30 +303,24 @@ export default function Page() {
           {!hasBranches ? (
             <MainCenteredContainer className="max-w-md">
               <BranchesNoBranches
-                parentEnvironment={branchableEnvironment}
+                env="preview"
                 limits={limits}
                 canUpgrade={canUpgrade ?? false}
+                showSelfServe={showSelfServe}
               />
             </MainCenteredContainer>
           ) : (
             <>
-              <div className="flex items-center justify-between gap-x-2 p-2">
+              <div className="flex items-center justify-between gap-x-1.5 p-2">
                 <BranchFilters />
-                <div className="flex items-center justify-end gap-x-2">
-                  <PaginationControls
-                    currentPage={currentPage}
-                    totalPages={totalPages}
-                    showPageNumbers={false}
-                  />
-                </div>
+                <PaginationControls
+                  currentPage={currentPage}
+                  totalPages={totalPages}
+                  showPageNumbers={false}
+                />
               </div>
 
-              <div
-                className={cn(
-                  "grid max-h-full min-h-full overflow-x-auto",
-                  totalPages > 1 ? "grid-rows-[1fr_auto]" : "grid-rows-[1fr]"
-                )}
-              >
+              <div className="grid max-h-full min-h-full grid-rows-[1fr] overflow-x-auto">
                 <Table>
                   <TableHeader>
                     <TableRow>
@@ -314,7 +368,7 @@ export default function Page() {
                             </TableCell>
                             <TableCell className={cellClass}>
                               {branch.archivedAt ? (
-                                <CheckIcon className="size-4 text-charcoal-400" />
+                                <CheckIcon className="size-4 text-text-dimmed" />
                               ) : (
                                 "–"
                               )}
@@ -324,7 +378,15 @@ export default function Page() {
                               isSticky
                               hiddenButtons={
                                 isSelected ? null : (
-                                  <PopoverMenuItem to={path} title="Switch to branch" />
+                                  <LinkButton
+                                    to={path}
+                                    variant="secondary/small"
+                                    LeadingIcon={IconArrowBearRight2}
+                                    leadingIconClassName="text-blue-500 -mr-2"
+                                    className="pl-1.5"
+                                  >
+                                    Switch to branch
+                                  </LinkButton>
                                 )
                               }
                               popoverContent={
@@ -333,8 +395,8 @@ export default function Page() {
                                     {isSelected ? null : (
                                       <PopoverMenuItem
                                         to={path}
-                                        icon={ArrowRightIcon}
-                                        leadingIconClassName="text-blue-500"
+                                        icon={IconArrowBearRight2}
+                                        leadingIconClassName="text-blue-500 -mr-0.5 -ml-1"
                                         title="Switch to branch"
                                       />
                                     )}
@@ -351,14 +413,6 @@ export default function Page() {
                     )}
                   </TableBody>
                 </Table>
-                <div
-                  className={cn(
-                    "flex min-h-full",
-                    totalPages > 1 && "justify-end border-t border-grid-dimmed px-2 py-3"
-                  )}
-                >
-                  <PaginationControls currentPage={currentPage} totalPages={totalPages} />
-                </div>
               </div>
 
               <div className="flex w-full items-start justify-between">
@@ -376,20 +430,20 @@ export default function Page() {
                           />
                           <circle
                             className={`fill-none ${
-                              requiresUpgrade ? "stroke-error" : "stroke-success"
+                              atBranchLimit ? "stroke-error" : "stroke-success"
                             }`}
                             strokeWidth="4"
                             r="10"
                             cx="12"
                             cy="12"
-                            strokeDasharray={`${(limits.used / limits.limit) * 62.8} 62.8`}
+                            strokeDasharray={`${usageRatio * 62.8} 62.8`}
                             strokeDashoffset="0"
                             strokeLinecap="round"
                           />
                         </svg>
                       </div>
                     }
-                    content={`${Math.round((limits.used / limits.limit) * 100)}%`}
+                    content={`${Math.round(usageRatio * 100)}%`}
                   />
                   <div className="flex w-full items-center justify-between gap-6">
                     {requiresUpgrade ? (
@@ -399,28 +453,43 @@ export default function Page() {
                       </Header3>
                     ) : (
                       <div className="flex items-center gap-1">
-                        <Header3>
+                        <Header3 className={atBranchLimit ? "text-error" : undefined}>
                           You've used {limits.used}/{limits.limit} of your branches
                         </Header3>
                         <InfoIconTooltip content="Archived branches don't count towards your limit." />
                       </div>
                     )}
 
-                    {canUpgrade ? (
-                      <LinkButton
-                        to={v3BillingPath(organization)}
-                        variant="secondary/small"
-                        LeadingIcon={ArrowUpCircleIcon}
-                        leadingIconClassName="text-indigo-500"
-                      >
-                        Upgrade
-                      </LinkButton>
-                    ) : (
-                      <Feedback
-                        button={<Button variant="secondary/small">Request more</Button>}
-                        defaultValue="help"
+                    {canPurchaseBranches && branchPricing ? (
+                      <PurchaseBranchesModal
+                        branchPricing={branchPricing}
+                        extraBranches={extraBranches}
+                        activeBranches={limits.used}
+                        maxQuota={maxBranchQuota}
+                        planBranchLimit={planBranchLimit}
                       />
-                    )}
+                    ) : canUpgrade ? (
+                      showSelfServe ? (
+                        <div className="flex items-center gap-3">
+                          <Paragraph variant="small" className="whitespace-nowrap text-text-dimmed">
+                            Upgrade plan for more Preview Branches
+                          </Paragraph>
+                          <LinkButton
+                            to={v3BillingPath(organization)}
+                            variant="secondary/small"
+                            LeadingIcon={ArrowUpCircleIcon}
+                            leadingIconClassName="text-indigo-500"
+                          >
+                            Upgrade
+                          </LinkButton>
+                        </div>
+                      ) : (
+                        <Feedback
+                          defaultValue="enterprise"
+                          button={<Button variant="secondary/small">Request more</Button>}
+                        />
+                      )
+                    ) : null}
                   </div>
                 </div>
               </div>
@@ -434,47 +503,31 @@ export default function Page() {
 
 export function BranchFilters() {
   const [searchParams, setSearchParams] = useSearchParams();
-  const { search, showArchived, page } = BranchesOptions.parse(
-    Object.fromEntries(searchParams.entries())
+  const { showArchived } = BranchesOptions.parse(Object.fromEntries(searchParams.entries()));
+
+  const handleArchivedChange = useCallback(
+    (checked: boolean) => {
+      setSearchParams((s) => {
+        if (checked) {
+          s.set("showArchived", "true");
+        } else {
+          s.delete("showArchived");
+        }
+        s.delete("page");
+        return s;
+      });
+    },
+    [setSearchParams]
   );
 
-  const handleFilterChange = useCallback((filterType: string, value: string | undefined) => {
-    setSearchParams((s) => {
-      if (value) {
-        searchParams.set(filterType, value);
-      } else {
-        searchParams.delete(filterType);
-      }
-      searchParams.delete("page");
-      return searchParams;
-    });
-  }, []);
-
-  const handleArchivedChange = useCallback((checked: boolean) => {
-    handleFilterChange("showArchived", checked ? "true" : undefined);
-  }, []);
-
-  const handleSearchChange = useThrottle((value: string) => {
-    handleFilterChange("search", value.length === 0 ? undefined : value);
-  }, 300);
-
   return (
-    <div className="flex w-full gap-2">
-      <Input
-        name="search"
-        placeholder="Search branch name"
-        icon={MagnifyingGlassIcon}
-        variant="tertiary"
-        className="grow"
-        defaultValue={search}
-        onChange={(e) => handleSearchChange(e.target.value)}
-      />
-
+    <div className="flex w-full items-center justify-between gap-2">
+      <SearchInput placeholder="Search branch name…" resetParams={["page"]} />
       <Switch
         checked={showArchived ?? false}
         onCheckedChange={handleArchivedChange}
         label="Show archived"
-        variant="small"
+        variant="secondary/small"
       />
     </div>
   );
@@ -483,14 +536,47 @@ export function BranchFilters() {
 function UpgradePanel({
   limits,
   canUpgrade,
+  canPurchaseBranches,
+  branchPricing,
+  extraBranches,
+  maxBranchQuota,
+  planBranchLimit,
 }: {
   limits: {
     used: number;
     limit: number;
   };
   canUpgrade: boolean;
+  canPurchaseBranches: boolean;
+  branchPricing: { stepSize: number; centsPerStep: number } | null;
+  extraBranches: number;
+  maxBranchQuota: number;
+  planBranchLimit: number;
 }) {
   const organization = useOrganization();
+  const showSelfServe = useShowSelfServe();
+
+  if (canPurchaseBranches && branchPricing) {
+    return (
+      <PurchaseBranchesModal
+        branchPricing={branchPricing}
+        extraBranches={extraBranches}
+        activeBranches={limits.used}
+        maxQuota={maxBranchQuota}
+        planBranchLimit={planBranchLimit}
+        triggerButton={
+          <Button
+            LeadingIcon={PlusIcon}
+            leadingIconClassName="text-white"
+            variant="primary/small"
+            shortcut={{ key: "n" }}
+          >
+            Purchase more…
+          </Button>
+        }
+      />
+    );
+  }
 
   return (
     <Dialog>
@@ -514,103 +600,292 @@ function UpgradePanel({
         </div>
         <DialogFooter>
           {canUpgrade ? (
-            <LinkButton variant="primary/small" to={v3BillingPath(organization)}>
-              Upgrade
-            </LinkButton>
-          ) : (
-            <Feedback
-              button={<Button variant="primary/small">Request more</Button>}
-              defaultValue="help"
-            />
-          )}
+            showSelfServe ? (
+              <LinkButton variant="primary/small" to={v3BillingPath(organization)}>
+                Upgrade
+              </LinkButton>
+            ) : (
+              <Feedback
+                defaultValue="enterprise"
+                button={<Button variant="secondary/small">Request more</Button>}
+              />
+            )
+          ) : null}
         </DialogFooter>
       </DialogContent>
     </Dialog>
   );
 }
 
-export function NewBranchPanel({
-  button,
-  parentEnvironment,
+function PurchaseBranchesModal({
+  branchPricing,
+  extraBranches,
+  activeBranches,
+  maxQuota,
+  planBranchLimit,
+  triggerButton,
 }: {
-  button: React.ReactNode;
-  parentEnvironment: { id: string };
+  branchPricing: {
+    stepSize: number;
+    centsPerStep: number;
+  };
+  extraBranches: number;
+  activeBranches: number;
+  maxQuota: number;
+  planBranchLimit: number;
+  triggerButton?: React.ReactNode;
 }) {
-  const lastSubmission = useActionData<typeof action>();
-  const location = useLocation();
-  const [searchParams, setSearchParams] = useSearchParams();
-  const [isOpen, setIsOpen] = useState(false);
-
-  const [form, { parentEnvironmentId, branchName, failurePath }] = useForm({
-    id: "create-branch",
-    lastSubmission: lastSubmission as any,
+  const showSelfServe = useShowSelfServe();
+  const fetcher = useFetcher();
+  const lastSubmission =
+    fetcher.data && typeof fetcher.data === "object" && "status" in fetcher.data
+      ? fetcher.data
+      : undefined;
+  const [form, { amount }] = useForm({
+    id: "purchase-branches",
+    lastResult: lastSubmission as any,
     onValidate({ formData }) {
-      return parse(formData, { schema });
+      return parseWithZod(formData, { schema: PurchaseSchema });
     },
-    shouldRevalidate: "onInput",
+    shouldRevalidate: "onSubmit",
   });
 
+  const [amountValue, setAmountValue] = useState(extraBranches);
   useEffect(() => {
-    if (searchParams.has("dialogClosed")) {
-      setSearchParams((s) => {
-        s.delete("dialogClosed");
-        return s;
-      });
-      setIsOpen(false);
+    // oxlint-disable-next-line react/set-state-in-effect, react/no-deriving-state-in-effects -- The authoritative branch count intentionally resets this modal draft.
+    setAmountValue(extraBranches);
+  }, [extraBranches]);
+  const isLoading = fetcher.state !== "idle";
+
+  const [open, setOpen] = useState(false);
+  useEffect(() => {
+    const data = fetcher.data;
+    if (
+      fetcher.state === "idle" &&
+      data !== null &&
+      typeof data === "object" &&
+      "ok" in data &&
+      data.ok
+    ) {
+      // oxlint-disable-next-line react/set-state-in-effect -- This effect intentionally synchronizes route state after an external or lifecycle change.
+      setOpen(false);
     }
-  }, [searchParams, setSearchParams]);
+  }, [fetcher.state, fetcher.data]);
+
+  const state = updateBranchState({
+    value: amountValue,
+    existingValue: extraBranches,
+    quota: maxQuota,
+    activeBranches,
+    planBranchLimit,
+  });
+  const changeClassName =
+    state === "decrease" ? "text-error" : state === "increase" ? "text-success" : undefined;
+
+  const pricePerBranch = branchPricing.centsPerStep / branchPricing.stepSize / 100;
+  const title = extraBranches === 0 ? "Purchase extra branches…" : "Add/remove extra branches…";
+
+  if (!showSelfServe) {
+    return (
+      <Feedback
+        defaultValue="enterprise"
+        button={<Button variant="secondary/small">Request more</Button>}
+      />
+    );
+  }
 
   return (
-    <Dialog open={isOpen} onOpenChange={setIsOpen}>
-      <DialogTrigger asChild>{button}</DialogTrigger>
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DialogTrigger asChild>
+        {triggerButton ?? (
+          <Button variant="primary/small" onClick={() => setOpen(true)}>
+            {title}
+          </Button>
+        )}
+      </DialogTrigger>
       <DialogContent>
-        <DialogHeader>New branch</DialogHeader>
-        <div className="mt-2 flex flex-col gap-4">
-          <Form method="post" {...form.props} className="w-full">
-            <Fieldset className="max-w-full gap-y-3">
-              <input
-                value={parentEnvironment.id}
-                {...conform.input(parentEnvironmentId, { type: "hidden" })}
-              />
-              <input
-                value={location.pathname}
-                {...conform.input(failurePath, { type: "hidden" })}
-              />
-              <InputGroup className="max-w-full">
-                <Label>Branch name</Label>
-                <Input {...conform.input(branchName)} />
-                <Hint>
-                  Must not contain: spaces <InlineCode variant="extra-small">~</InlineCode>{" "}
-                  <InlineCode variant="extra-small">^</InlineCode>{" "}
-                  <InlineCode variant="extra-small">:</InlineCode>{" "}
-                  <InlineCode variant="extra-small">?</InlineCode>{" "}
-                  <InlineCode variant="extra-small">*</InlineCode>{" "}
-                  <InlineCode variant="extra-small">{"["}</InlineCode>{" "}
-                  <InlineCode variant="extra-small">\</InlineCode>{" "}
-                  <InlineCode variant="extra-small">//</InlineCode>{" "}
-                  <InlineCode variant="extra-small">..</InlineCode>{" "}
-                  <InlineCode variant="extra-small">{"@{"}</InlineCode>{" "}
-                  <InlineCode variant="extra-small">.lock</InlineCode>
-                </Hint>
-                <FormError id={branchName.errorId}>{branchName.error}</FormError>
+        <DialogHeader>{title}</DialogHeader>
+        <fetcher.Form method="post" {...getFormProps(form)}>
+          <input type="hidden" name="_formType" value="purchase-branches" />
+          <div className="flex flex-col gap-4 pt-2">
+            <div className="flex flex-col gap-1">
+              <Paragraph variant="small/bright">
+                Purchase extra preview branches at {formatCurrency(pricePerBranch, false)}/month per
+                branch. Reducing the number of branches will take effect at the start of the next
+                billing cycle (1st of the month).
+              </Paragraph>
+            </div>
+            <Fieldset>
+              <InputGroup fullWidth>
+                <Label htmlFor="amount" className="text-text-dimmed">
+                  Total extra branches
+                </Label>
+                <InputNumberStepper
+                  {...getInputProps(amount, { type: "number" })}
+                  step={branchPricing.stepSize}
+                  min={0}
+                  max={undefined}
+                  value={amountValue}
+                  onChange={(e) => setAmountValue(Number(e.target.value))}
+                  disabled={isLoading}
+                />
+                <FormError id={amount.errorId}>{amount.errors}</FormError>
+                <FormError>{form.errors}</FormError>
               </InputGroup>
-              <FormError>{form.error}</FormError>
-              <FormButtons
-                confirmButton={
-                  <Button type="submit" variant="primary/medium">
-                    Create branch
-                  </Button>
-                }
-                cancelButton={
-                  <DialogClose asChild>
-                    <Button variant="tertiary/medium">Cancel</Button>
-                  </DialogClose>
-                }
-              />
             </Fieldset>
-          </Form>
-        </div>
+            {state === "need_to_archive" ? (
+              <div className="flex flex-col pb-3">
+                <Paragraph variant="small" className="text-warning" spacing>
+                  You need to archive{" "}
+                  {formatNumber(activeBranches - (planBranchLimit + amountValue))} more{" "}
+                  {activeBranches - (planBranchLimit + amountValue) === 1 ? "branch" : "branches"}{" "}
+                  before you can reduce to this level.
+                </Paragraph>
+              </div>
+            ) : state === "above_quota" ? (
+              <div className="flex flex-col pb-3">
+                <Paragraph variant="small" className="text-warning" spacing>
+                  Currently you can only have up to {maxQuota} extra preview branches. Send a
+                  request below to lift your current limit. We'll get back to you soon.
+                </Paragraph>
+              </div>
+            ) : (
+              <div className="flex flex-col pb-3 tabular-nums">
+                <div className="grid grid-cols-2 border-b border-grid-dimmed pb-1">
+                  <Header3 className="font-normal text-text-dimmed">Summary</Header3>
+                  <Header3 className="justify-self-end font-normal text-text-dimmed">Total</Header3>
+                </div>
+                <div className="grid grid-cols-2 pt-2">
+                  <Header3 className="pb-0 font-normal text-text-dimmed">
+                    <span className="text-text-bright">{formatNumber(extraBranches)}</span> current
+                    extra
+                  </Header3>
+                  <Header3 className="justify-self-end font-normal text-text-bright">
+                    {formatCurrency(extraBranches * pricePerBranch, true)}
+                  </Header3>
+                </div>
+                <div className="grid grid-cols-2 text-xs">
+                  <span className="text-text-dimmed">
+                    ({extraBranches} {extraBranches === 1 ? "branch" : "branches"})
+                  </span>
+                  <span className="justify-self-end text-text-dimmed">/mth</span>
+                </div>
+                <div className="grid grid-cols-2 pt-2">
+                  <Header3 className={cn("pb-0 font-normal", changeClassName)}>
+                    {state === "increase" ? "+" : null}
+                    {formatNumber(amountValue - extraBranches)}
+                  </Header3>
+                  <Header3 className={cn("justify-self-end font-normal", changeClassName)}>
+                    {state === "increase" ? "+" : null}
+                    {formatCurrency((amountValue - extraBranches) * pricePerBranch, true)}
+                  </Header3>
+                </div>
+                <div className="grid grid-cols-2 text-xs">
+                  <span className="text-text-dimmed">
+                    ({Math.abs(amountValue - extraBranches)}{" "}
+                    {Math.abs(amountValue - extraBranches) === 1 ? "branch" : "branches"} @{" "}
+                    {formatCurrency(pricePerBranch, true)}/mth)
+                  </span>
+                  <span className="justify-self-end text-text-dimmed">/mth</span>
+                </div>
+                <div className="grid grid-cols-2 pt-2">
+                  <Header3 className="pb-0 font-normal text-text-dimmed">
+                    <span className="text-text-bright">{formatNumber(amountValue)}</span> new total
+                  </Header3>
+                  <Header3 className="justify-self-end font-normal text-text-bright">
+                    {formatCurrency(amountValue * pricePerBranch, true)}
+                  </Header3>
+                </div>
+                <div className="grid grid-cols-2 text-xs">
+                  <span className="text-text-dimmed">
+                    ({amountValue} {amountValue === 1 ? "branch" : "branches"})
+                  </span>
+                  <span className="justify-self-end text-text-dimmed">/mth</span>
+                </div>
+              </div>
+            )}
+          </div>
+          <FormButtons
+            confirmButton={
+              state === "above_quota" ? (
+                <>
+                  <input type="hidden" name="action" value="quota-increase" />
+                  <Button
+                    LeadingIcon={isLoading ? SpinnerWhite : EnvelopeIcon}
+                    variant="primary/medium"
+                    type="submit"
+                    disabled={isLoading}
+                  >
+                    <span className="tabular-nums">{`Send request for ${formatNumber(
+                      amountValue
+                    )}`}</span>
+                  </Button>
+                </>
+              ) : state === "decrease" || state === "need_to_archive" ? (
+                <>
+                  <input type="hidden" name="action" value="purchase" />
+                  <Button
+                    variant="danger/medium"
+                    type="submit"
+                    disabled={isLoading || state === "need_to_archive"}
+                    LeadingIcon={isLoading ? SpinnerWhite : undefined}
+                  >
+                    <span className="tabular-nums">{`Remove ${formatNumber(
+                      extraBranches - amountValue
+                    )} ${extraBranches - amountValue === 1 ? "branch" : "branches"}`}</span>
+                  </Button>
+                </>
+              ) : (
+                <>
+                  <input type="hidden" name="action" value="purchase" />
+                  <Button
+                    variant="primary/medium"
+                    type="submit"
+                    disabled={isLoading || state === "no_change"}
+                    LeadingIcon={isLoading ? SpinnerWhite : undefined}
+                  >
+                    <span className="tabular-nums">{`Purchase ${formatNumber(
+                      amountValue - extraBranches
+                    )} ${amountValue - extraBranches === 1 ? "branch" : "branches"}`}</span>
+                  </Button>
+                </>
+              )
+            }
+            cancelButton={
+              <DialogClose asChild>
+                <Button variant="secondary/medium" disabled={isLoading}>
+                  Cancel
+                </Button>
+              </DialogClose>
+            }
+          />
+        </fetcher.Form>
       </DialogContent>
     </Dialog>
   );
+}
+
+function updateBranchState({
+  value,
+  existingValue,
+  quota,
+  activeBranches,
+  planBranchLimit,
+}: {
+  value: number;
+  existingValue: number;
+  quota: number;
+  activeBranches: number;
+  planBranchLimit: number;
+}): "no_change" | "increase" | "decrease" | "above_quota" | "need_to_archive" {
+  if (value === existingValue) return "no_change";
+  if (value < existingValue) {
+    const newTotalLimit = planBranchLimit + value;
+    if (activeBranches > newTotalLimit) {
+      return "need_to_archive";
+    }
+    return "decrease";
+  }
+  if (value > quota) return "above_quota";
+  return "increase";
 }

@@ -1,10 +1,15 @@
-import { ActionFunctionArgs } from "@remix-run/server-runtime";
+import { type ActionFunctionArgs } from "@remix-run/server-runtime";
 import { typedjson } from "remix-typedjson";
 import { z } from "zod";
-import { redirectWithSuccessMessage, redirectWithErrorMessage, typedJsonWithSuccessMessage } from "~/models/message.server";
+import {
+  redirectWithSuccessMessage,
+  redirectWithErrorMessage,
+  typedJsonWithSuccessMessage,
+} from "~/models/message.server";
 import { MultiFactorAuthenticationService } from "~/services/mfa/multiFactorAuthentication.server";
 import { requireUserId } from "~/services/session.server";
 import { ServiceValidationError } from "~/v3/services/baseService.server";
+import { MfaRateLimitError } from "~/services/mfa/mfaRateLimiterGlobal.server";
 import { useMfaSetup } from "./useMfaSetup";
 import { MfaToggle } from "./MfaToggle";
 import { MfaSetupDialog } from "./MfaSetupDialog";
@@ -132,14 +137,28 @@ export async function action({ request }: ActionFunctionArgs) {
     if (error instanceof ServiceValidationError) {
       return redirectWithErrorMessage("/account/security", request, error.message);
     }
-    
+
+    if (error instanceof MfaRateLimitError) {
+      return redirectWithErrorMessage(
+        "/account/security",
+        request,
+        "Too many attempts. Please try again later."
+      );
+    }
+
     // Re-throw unexpected errors
     throw error;
   }
 }
 
 export function MfaSetup({ isEnabled }: { isEnabled: boolean }) {
-  const { state, actions, isQrDialogOpen, isRecoveryDialogOpen, isDisableDialogOpen } = useMfaSetup(isEnabled);
+  const {
+    state,
+    actions,
+    isQrDialogOpen,
+    isRecoveryDialogOpen: _isRecoveryDialogOpen,
+    isDisableDialogOpen,
+  } = useMfaSetup(isEnabled);
 
   const handleToggle = (enabled: boolean) => {
     if (enabled && !state.isEnabled) {
@@ -151,10 +170,7 @@ export function MfaSetup({ isEnabled }: { isEnabled: boolean }) {
 
   return (
     <>
-      <MfaToggle
-        isEnabled={state.isEnabled}
-        onToggle={handleToggle}
-      />
+      <MfaToggle isEnabled={state.isEnabled} onToggle={handleToggle} />
 
       <MfaSetupDialog
         isOpen={isQrDialogOpen}

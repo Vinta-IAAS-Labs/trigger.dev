@@ -20,6 +20,7 @@ export class NewAlertChannelPresenter extends BasePresenter {
       where: {
         service: "SLACK",
         organizationId: project.organizationId,
+        deletedAt: null,
       },
       orderBy: {
         createdAt: "desc",
@@ -148,11 +149,11 @@ async function getAllSlackConversations(client: WebClient) {
 function isSlackError(obj: unknown): obj is { data: { error: string } } {
   return Boolean(
     typeof obj === "object" &&
-      obj !== null &&
-      "data" in obj &&
-      typeof obj.data === "object" &&
-      obj.data !== null &&
-      "error" in obj.data &&
-      typeof obj.data.error === "string"
+    obj !== null &&
+    "data" in obj &&
+    typeof obj.data === "object" &&
+    obj.data !== null &&
+    "error" in obj.data &&
+    typeof obj.data.error === "string"
   );
 }

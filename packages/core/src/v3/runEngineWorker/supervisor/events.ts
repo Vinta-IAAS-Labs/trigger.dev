@@ -1,11 +1,13 @@
-import { TaskRunExecutionResult } from "../../schemas/common.js";
-import { DequeuedMessage, StartRunAttemptResult } from "../../schemas/runEngine.js";
+import type { TaskRunExecutionResult } from "../../schemas/common.js";
+import type { DequeuedMessage, StartRunAttemptResult } from "../../schemas/runEngine.js";
 
 export type WorkerEvents = {
   runQueueMessage: [
     {
       time: Date;
       message: DequeuedMessage;
+      dequeueResponseMs?: number;
+      pollingIntervalMs?: number;
     },
   ];
   requestRunAttemptStart: [
@@ -47,5 +49,3 @@ export type WorkerEvents = {
     },
   ];
 };
-
-export type WorkerEventArgs<T extends keyof WorkerEvents> = WorkerEvents[T];

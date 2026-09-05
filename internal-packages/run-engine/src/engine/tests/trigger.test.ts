@@ -1,7 +1,7 @@
 import { assertNonNullable, containerTest } from "@internal/testcontainers";
 import { trace } from "@internal/tracing";
 import { expect } from "vitest";
-import { EventBusEventArgs } from "../eventBus.js";
+import type { EventBusEventArgs } from "../eventBus.js";
 import { RunEngine } from "../index.js";
 import { setupAuthenticatedEnvironment, setupBackgroundWorker } from "./setup.js";
 import { setTimeout } from "node:timers/promises";
@@ -48,7 +48,7 @@ describe("RunEngine trigger()", () => {
       const taskIdentifier = "test-task";
 
       //create background worker
-      const backgroundWorker = await setupBackgroundWorker(
+      const _backgroundWorker = await setupBackgroundWorker(
         engine,
         authenticatedEnvironment,
         taskIdentifier
@@ -103,9 +103,8 @@ describe("RunEngine trigger()", () => {
       expect(queueLength).toBe(1);
 
       //concurrency before
-      const envConcurrencyBefore = await engine.runQueue.currentConcurrencyOfEnvironment(
-        authenticatedEnvironment
-      );
+      const envConcurrencyBefore =
+        await engine.runQueue.currentConcurrencyOfEnvironment(authenticatedEnvironment);
       expect(envConcurrencyBefore).toBe(0);
 
       await setTimeout(500);
@@ -119,9 +118,8 @@ describe("RunEngine trigger()", () => {
       expect(dequeued[0].run.id).toBe(run.id);
       expect(dequeued[0].run.attemptNumber).toBe(1);
 
-      const envConcurrencyAfter = await engine.runQueue.currentConcurrencyOfEnvironment(
-        authenticatedEnvironment
-      );
+      const envConcurrencyAfter =
+        await engine.runQueue.currentConcurrencyOfEnvironment(authenticatedEnvironment);
       expect(envConcurrencyAfter).toBe(1);
 
       let attemptEvent: EventBusEventArgs<"runAttemptStarted">[0] | undefined = undefined;
@@ -186,9 +184,8 @@ describe("RunEngine trigger()", () => {
       expect(completedEvent.run.outputType).toBe("application/json");
 
       //concurrency should have been released
-      const envConcurrencyCompleted = await engine.runQueue.currentConcurrencyOfEnvironment(
-        authenticatedEnvironment
-      );
+      const envConcurrencyCompleted =
+        await engine.runQueue.currentConcurrencyOfEnvironment(authenticatedEnvironment);
       expect(envConcurrencyCompleted).toBe(0);
 
       //standalone triggers don't create waitpoints, so none should exist
@@ -242,7 +239,7 @@ describe("RunEngine trigger()", () => {
       const taskIdentifier = "test-task";
 
       //create background worker
-      const backgroundWorker = await setupBackgroundWorker(
+      const _backgroundWorker = await setupBackgroundWorker(
         engine,
         authenticatedEnvironment,
         taskIdentifier
@@ -312,9 +309,8 @@ describe("RunEngine trigger()", () => {
       expect(executionData3.run.status).toBe("COMPLETED_WITH_ERRORS");
 
       //concurrency should have been released
-      const envConcurrencyCompleted = await engine.runQueue.currentConcurrencyOfEnvironment(
-        authenticatedEnvironment
-      );
+      const envConcurrencyCompleted =
+        await engine.runQueue.currentConcurrencyOfEnvironment(authenticatedEnvironment);
       expect(envConcurrencyCompleted).toBe(0);
 
       //standalone triggers don't create waitpoints, so none should exist
@@ -328,4 +324,202 @@ describe("RunEngine trigger()", () => {
       await engine.quit();
     }
   });
+
+  containerTest("Annotations are stored on the run", async ({ prisma, redisOptions }) => {
+    const authenticatedEnvironment = await setupAuthenticatedEnvironment(prisma, "PRODUCTION");
+
+    const engine = new RunEngine({
+      prisma,
+      worker: {
+        redis: redisOptions,
+        workers: 1,
+        tasksPerWorker: 10,
+        pollIntervalMs: 100,
+      },
+      queue: {
+        redis: redisOptions,
+        masterQueueConsumersDisabled: true,
+        processWorkerQueueDebounceMs: 50,
+      },
+      runLock: { redis: redisOptions },
+      machines: {
+        defaultMachine: "small-1x",
+        machines: {
+          "small-1x": { name: "small-1x" as const, cpu: 0.5, memory: 0.5, centsPerMs: 0.0001 },
+        },
+        baseCostInCents: 0.0001,
+      },
+      tracer: trace.getTracer("test", "0.0.0"),
+    });
+
+    try {
+      const taskIdentifier = "test-task";
+      await setupBackgroundWorker(engine, authenticatedEnvironment, taskIdentifier);
+
+      const run = await engine.trigger(
+        {
+          number: 1,
+          friendlyId: "run_ann1234",
+          environment: authenticatedEnvironment,
+          taskIdentifier,
+          payload: "{}",
+          payloadType: "application/json",
+          context: {},
+          traceContext: {},
+          traceId: "t12345",
+          spanId: "s12345",
+          workerQueue: "main",
+          queue: `task/${taskIdentifier}`,
+          isTest: false,
+          tags: [],
+          annotations: {
+            triggerSource: "schedule",
+            triggerAction: "trigger",
+            rootTriggerSource: "schedule",
+            rootScheduleId: "sched_abc123",
+          },
+        },
+        prisma
+      );
+
+      const runFromDb = await prisma.taskRun.findUnique({
+        where: { id: run.id },
+      });
+
+      expect(runFromDb).toBeDefined();
+      expect(runFromDb?.annotations).toEqual({
+        triggerSource: "schedule",
+        triggerAction: "trigger",
+        rootTriggerSource: "schedule",
+        rootScheduleId: "sched_abc123",
+      });
+    } finally {
+      await engine.quit();
+    }
+  });
+
+  containerTest(
+    "Annotations propagation pattern (parent → child)",
+    async ({ prisma, redisOptions }) => {
+      const authenticatedEnvironment = await setupAuthenticatedEnvironment(prisma, "PRODUCTION");
+
+      const engine = new RunEngine({
+        prisma,
+        worker: {
+          redis: redisOptions,
+          workers: 1,
+          tasksPerWorker: 10,
+          pollIntervalMs: 100,
+        },
+        queue: {
+          redis: redisOptions,
+          masterQueueConsumersDisabled: true,
+          processWorkerQueueDebounceMs: 50,
+        },
+        runLock: { redis: redisOptions },
+        machines: {
+          defaultMachine: "small-1x",
+          machines: {
+            "small-1x": {
+              name: "small-1x" as const,
+              cpu: 0.5,
+              memory: 0.5,
+              centsPerMs: 0.0001,
+            },
+          },
+          baseCostInCents: 0.0001,
+        },
+        tracer: trace.getTracer("test", "0.0.0"),
+      });
+
+      try {
+        const parentTask = "parent-task";
+        const childTask = "child-task";
+        await setupBackgroundWorker(engine, authenticatedEnvironment, [parentTask, childTask]);
+
+        // Trigger parent with schedule annotations
+        const parentRun = await engine.trigger(
+          {
+            number: 1,
+            friendlyId: "run_p1234ann",
+            environment: authenticatedEnvironment,
+            taskIdentifier: parentTask,
+            payload: "{}",
+            payloadType: "application/json",
+            context: {},
+            traceContext: {},
+            traceId: "t12345",
+            spanId: "s12345",
+            workerQueue: "main",
+            queue: `task/${parentTask}`,
+            isTest: false,
+            tags: [],
+            annotations: {
+              triggerSource: "schedule",
+              triggerAction: "trigger",
+              rootTriggerSource: "schedule",
+              rootScheduleId: "sched_abc123",
+            },
+          },
+          prisma
+        );
+
+        // Trigger child — simulating what RunEngineTriggerTaskService builds:
+        // triggerSource is "sdk" (child triggered from within parent),
+        // but rootTriggerSource and rootScheduleId are propagated from parent
+        const childRun = await engine.trigger(
+          {
+            number: 2,
+            friendlyId: "run_c1234ann",
+            environment: authenticatedEnvironment,
+            taskIdentifier: childTask,
+            payload: "{}",
+            payloadType: "application/json",
+            context: {},
+            traceContext: {},
+            traceId: "t12345",
+            spanId: "s12346",
+            workerQueue: "main",
+            queue: `task/${childTask}`,
+            isTest: false,
+            tags: [],
+            parentTaskRunId: parentRun.id,
+            resumeParentOnCompletion: true,
+            annotations: {
+              triggerSource: "sdk",
+              triggerAction: "trigger",
+              rootTriggerSource: "schedule",
+              rootScheduleId: "sched_abc123",
+            },
+          },
+          prisma
+        );
+
+        const parentFromDb = await prisma.taskRun.findUnique({
+          where: { id: parentRun.id },
+        });
+        const childFromDb = await prisma.taskRun.findUnique({
+          where: { id: childRun.id },
+        });
+
+        // Parent: schedule-triggered
+        expect(parentFromDb?.annotations).toEqual({
+          triggerSource: "schedule",
+          triggerAction: "trigger",
+          rootTriggerSource: "schedule",
+          rootScheduleId: "sched_abc123",
+        });
+
+        // Child: sdk-triggered but root is still schedule
+        expect(childFromDb?.annotations).toEqual({
+          triggerSource: "sdk",
+          triggerAction: "trigger",
+          rootTriggerSource: "schedule",
+          rootScheduleId: "sched_abc123",
+        });
+      } finally {
+        await engine.quit();
+      }
+    }
+  );
 });
